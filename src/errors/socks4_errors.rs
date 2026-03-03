@@ -190,6 +190,18 @@ pub enum SOCKS4Error {
         code: u8,
     },
 
+    /// Internal misuse: success code passed to reply-code error mapper.
+    ///
+    /// Indicates `from_reply_code` was called with `0x5A` (success), which is
+    /// not an error code and should have been handled by caller logic.
+    #[error(
+        "internal SOCKS4 error: success reply code 0x5A was treated as an error for {proxy_addr}"
+    )]
+    UnexpectedSuccessCode {
+        /// Proxy address associated with the unexpected success code.
+        proxy_addr: String,
+    },
+
     /* Target Validation Errors */
     /// Target URL has no host.
     ///
@@ -270,16 +282,9 @@ impl SOCKS4Error {
     /// This method is not part of the public API. Errors are created automatically
     /// during SOCKS4 handshakes when the proxy returns error codes.
     ///
-    /// # Panics
-    ///
-    /// Panics if called with 0x5A (success code). Callers should check for
-    /// success before calling this function.
     pub(crate) fn from_reply_code(reply_code: u8, proxy_addr: String) -> Self {
         match reply_code {
-            0x5A => {
-                // This is success, not an error - caller should check before calling
-                unreachable!("0x5A is success code, not an error")
-            }
+            0x5A => Self::UnexpectedSuccessCode { proxy_addr },
             0x5B => Self::RequestRejected { proxy_addr },
             0x5C => Self::IdentdNotRunning { proxy_addr },
             0x5D => Self::IdentdMismatch { proxy_addr },

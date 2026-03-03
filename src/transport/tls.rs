@@ -134,7 +134,7 @@ where
             );
             Err(TLSError::HandshakeFailed {
                 host: server_name.to_string(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                source: std::io::Error::other(e.to_string()),
             })
         }
         Err(_) => {

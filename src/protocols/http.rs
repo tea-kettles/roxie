@@ -477,7 +477,7 @@ fn parse_status_code(buf: &[u8], proxy_addr: &str) -> Result<u16, HTTPError> {
         + (code_bytes[1] - b'0') as u16 * 10
         + (code_bytes[2] - b'0') as u16;
 
-    if code < 100 || code > 599 {
+    if !(100..=599).contains(&code) {
         return Err(HTTPError::HTTPStatusCodeOutOfRange {
             proxy_addr: proxy_addr.to_string(),
             code,
@@ -620,7 +620,7 @@ fn validate_authority(authority: &[u8]) -> Result<(), HTTPError> {
 
 /// Calculate Base64 encoded size.
 fn base64_encoded_size(input_len: usize) -> usize {
-    ((input_len + 2) / 3) * 4
+    input_len.div_ceil(3) * 4
 }
 
 /// Build HTTP CONNECT request.

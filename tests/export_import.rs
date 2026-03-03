@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs;
 use std::time::Duration;
 
 use roxie::config::{BaseProxyConfig, HasBaseProxyConfig};
@@ -9,18 +8,29 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tracing_subscriber;
 
+/// Inline proxy list used by tests that previously required an external file.
+///
+/// Covers HTTP, HTTPS, SOCKS4, SOCKS4A, SOCKS5, and SOCKS5H to exercise
+/// all protocol-specific export/import paths.
+const SAMPLE_PROXIES_JSON: &str = r#"[
+    "http://proxy1.test:8080",
+    "http://user:pass@proxy2.test:8080",
+    "https://proxy3.test:8443",
+    "https://user:pass@proxy4.test:8443",
+    "socks4://proxy5.test:1080",
+    "socks4a://proxy6.test:1080",
+    "socks5://proxy7.test:1080",
+    "socks5://user:pass@proxy8.test:1080",
+    "socks5h://proxy9.test:1080"
+]"#;
+
 #[tokio::test]
 async fn proxylist_export_import_roundtrip() {
     init_test_logging();
 
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let proxies_path = format!("{}/tests/proxies.json", manifest_dir);
-    let proxies_json = fs::read_to_string(&proxies_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", proxies_path, e));
-
-    let list = ProxyList::from_array(&proxies_json)
-        .unwrap_or_else(|e| panic!("failed to parse proxies.json: {}", e));
-    assert!(!list.is_empty(), "proxies.json contained no proxies");
+    let list = ProxyList::from_array(SAMPLE_PROXIES_JSON)
+        .expect("failed to parse inline proxy list");
+    assert!(!list.is_empty(), "inline proxy list contained no proxies");
 
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let export_path = temp_dir.path().join("exported_proxies.json");
@@ -60,14 +70,9 @@ async fn proxylist_export_import_roundtrip() {
 async fn proxylist_export_import_applies_auto_tls_overrides() {
     init_test_logging();
 
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let proxies_path = format!("{}/tests/proxies.json", manifest_dir);
-    let proxies_json = fs::read_to_string(&proxies_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", proxies_path, e));
-
-    let list = ProxyList::from_array(&proxies_json)
-        .unwrap_or_else(|e| panic!("failed to parse proxies.json: {}", e));
-    assert!(!list.is_empty(), "proxies.json contained no proxies");
+    let list = ProxyList::from_array(SAMPLE_PROXIES_JSON)
+        .expect("failed to parse inline proxy list");
+    assert!(!list.is_empty(), "inline proxy list contained no proxies");
 
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let export_path = temp_dir.path().join("exported_proxies.json");

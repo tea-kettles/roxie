@@ -331,7 +331,7 @@ async fn detect_protocol(
     phase_timeout: Duration,
 ) -> String {
     // Check for SOCKS5 version byte
-    if initial_bytes.len() >= 1 && initial_bytes[0] == 0x05 {
+    if !initial_bytes.is_empty() && initial_bytes[0] == 0x05 {
         return "SOCKS5 (version byte 0x05)".to_string();
     }
 
@@ -349,10 +349,10 @@ async fn detect_protocol(
             .is_ok()
         {
             let all_bytes = [initial_bytes, &extra].concat();
-            if let Ok(s) = std::str::from_utf8(&all_bytes) {
-                if s.starts_with("HTTP/") {
-                    return "HTTP server".to_string();
-                }
+            if let Ok(s) = std::str::from_utf8(&all_bytes)
+                && s.starts_with("HTTP/")
+            {
+                return "HTTP server".to_string();
             }
         }
         return "HTTP-like response".to_string();
@@ -425,18 +425,18 @@ fn encode_request(
     pos += 1;
 
     // Domain name for SOCKS4A (if applicable)
-    if use_socks4a {
-        if let Endpoint::Domain(domain) = endpoint {
-            if domain.len() > MAX_DOMAIN_LENGTH {
-                return Err(SOCKS4Error::DomainTooLong);
-            }
-            buf[pos..pos + domain.len()].copy_from_slice(domain);
-            pos += domain.len();
-
-            // Null terminator after domain
-            buf[pos] = SOCKS4_NULL_TERMINATOR;
-            pos += 1;
+    if use_socks4a
+        && let Endpoint::Domain(domain) = endpoint
+    {
+        if domain.len() > MAX_DOMAIN_LENGTH {
+            return Err(SOCKS4Error::DomainTooLong);
         }
+        buf[pos..pos + domain.len()].copy_from_slice(domain);
+        pos += domain.len();
+
+        // Null terminator after domain
+        buf[pos] = SOCKS4_NULL_TERMINATOR;
+        pos += 1;
     }
 
     Ok(pos)

@@ -34,16 +34,9 @@ use std::io;
 ///
 /// **Placeholder:** This error type is not yet implemented. It will be populated
 /// when Hysteria2 protocol support is added to roxie.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Hysteria2Error {
-    /// Placeholder variant for unimplemented Hysteria2 protocol.
-    ///
-    /// This variant exists to make the enum non-empty and allow compilation.
-    /// It should be removed when real Hysteria2 error variants are added.
-    #[error("Hysteria2 protocol not yet implemented")]
-    #[doc(hidden)]
-    NotImplemented,
-
     /// Placeholder for future I/O errors.
     #[error("I/O error: {source}")]
     #[doc(hidden)]

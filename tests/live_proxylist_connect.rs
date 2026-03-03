@@ -13,16 +13,17 @@ use tracing_subscriber;
 use url::Url;
 
 // cargo test --test proxylist_connect -- --ignored
+const PROXY_FILE: &str = "ss_proxies.json";
 
 #[tokio::test]
 #[ignore]
 async fn proxylist_connects_to_google() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
         .with_test_writer()
-        .init();
+        .try_init();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let proxies_path = format!("{}/tests/proxies.json", manifest_dir);
+    let proxies_path = format!("{}/{}", manifest_dir, PROXY_FILE);
     let proxies_json = fs::read_to_string(&proxies_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", proxies_path, e));
 
@@ -98,7 +99,7 @@ async fn proxy_single_random_connect_trace_logging() {
         .try_init();
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let proxies_path = format!("{}/tests/proxies.json", manifest_dir);
+    let proxies_path = format!("{}/{}", manifest_dir, PROXY_FILE);
     let proxies_json = fs::read_to_string(&proxies_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", proxies_path, e));
 
@@ -155,7 +156,7 @@ async fn proxylist_autotls_trace() {
         .try_init();
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let proxies_path = format!("{}/tests/proxies.json", manifest_dir);
+    let proxies_path = format!("{}/{}", manifest_dir, PROXY_FILE);
     let proxies_json = fs::read_to_string(&proxies_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", proxies_path, e));
 

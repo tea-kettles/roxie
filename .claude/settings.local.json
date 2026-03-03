@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check --all-features)",
+      "Bash(cargo clippy --all-features)",
+      "Bash(cargo test --all-features)",
+      "Bash(cargo doc --all-features --no-deps)",
+      "Bash(cargo test --all-features --lib)",
+      "Bash(cargo test --all-features --doc)"
+    ]
+  }
+}
