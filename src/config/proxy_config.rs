@@ -345,14 +345,14 @@ impl BaseProxyConfig {
             });
         }
 
-        if let Some(keep_alive) = self.keep_alive {
-            if keep_alive.is_zero() {
-                return Err(ConfigError::InvalidValue {
-                    field: "keep_alive".to_string(),
-                    value: "0s".to_string(),
-                    expected: "non-zero duration or None".to_string(),
-                });
-            }
+        if let Some(keep_alive) = self.keep_alive
+            && keep_alive.is_zero()
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "keep_alive".to_string(),
+                value: "0s".to_string(),
+                expected: "non-zero duration or None".to_string(),
+            });
         }
 
         Ok(())

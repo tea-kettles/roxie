@@ -6,6 +6,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(all(feature = "http", feature = "shadowsocks"))]
+use base64::Engine as _;
 use serde_json::Value;
 use tracing::warn;
 use url::Url;
@@ -170,15 +172,19 @@ pub fn parse_proxy_url(url_str: &str) -> Result<Option<Proxy>, ParseError> {
 
         #[cfg(feature = "shadowsocks")]
         "shadowsocks" | "ss" => {
-            let password = password.clone().ok_or_else(|| ParseError::MissingField {
-                field: "password".to_string(),
-            })?;
+            let (host, port, password, config) = parse_shadowsocks_url_credentials(
+                &host,
+                port,
+                &username,
+                &password,
+                url_str,
+            )?;
 
             Ok(Some(Proxy::Shadowsocks {
                 host,
                 port,
                 password,
-                config: Arc::new(ShadowsocksConfig::new()),
+                config: Arc::new(config),
             }))
         }
 
@@ -201,6 +207,99 @@ fn default_port_for_scheme(scheme: &str) -> u16 {
         "shadowsocks" | "ss" => DEFAULT_SHADOWSOCKS_PORT,
         _ => 8080, // Fallback
     }
+}
+
+#[cfg(feature = "shadowsocks")]
+fn parse_shadowsocks_url_credentials(
+    host: &str,
+    port: u16,
+    username: &Option<String>,
+    password: &Option<String>,
+    url_str: &str,
+) -> Result<(String, u16, String, ShadowsocksConfig), ParseError> {
+    if let Some(pass) = password {
+        let mut config = ShadowsocksConfig::new();
+        if let Some(method) = username
+            && !method.is_empty()
+        {
+            config = config.set_method(method);
+        }
+        return Ok((host.to_string(), port, pass.clone(), config));
+    }
+
+    if let Some(encoded) = username
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        let decoded = decode_ss_userinfo(encoded).ok_or_else(|| ParseError::InvalidFieldValue {
+            field: "ss userinfo".to_string(),
+            reason: format!(
+                "expected base64-encoded 'method:password' in URL '{}'",
+                url_str
+            ),
+        })?;
+
+        let (method, pass) = decoded
+            .split_once(':')
+            .ok_or_else(|| ParseError::InvalidFieldValue {
+                field: "ss userinfo".to_string(),
+                reason: format!("decoded userinfo must be 'method:password', got '{}'", decoded),
+            })?;
+
+        if method.is_empty() || pass.is_empty() {
+            return Err(ParseError::InvalidFieldValue {
+                field: "ss userinfo".to_string(),
+                reason: "decoded method/password cannot be empty".to_string(),
+            });
+        }
+
+        let config = ShadowsocksConfig::new().set_method(method);
+        return Ok((host.to_string(), port, pass.to_string(), config));
+    }
+
+    // Legacy SIP002 variant:
+    // ss://BASE64(method:password@host:port)#tag
+    if let Some(decoded) = decode_ss_userinfo(host) {
+        if let Some((creds, host_port)) = decoded.rsplit_once('@')
+            && let Some((method, pass)) = creds.split_once(':')
+            && let Some((decoded_host, decoded_port)) = split_host_port(host_port)
+            && !method.is_empty()
+            && !pass.is_empty()
+        {
+            let config = ShadowsocksConfig::new().set_method(method);
+            return Ok((decoded_host.to_string(), decoded_port, pass.to_string(), config));
+        }
+    }
+
+    Err(ParseError::MissingField {
+        field: "password".to_string(),
+    })
+}
+
+#[cfg(feature = "shadowsocks")]
+fn split_host_port(host_port: &str) -> Option<(&str, u16)> {
+    let (h, p) = host_port.rsplit_once(':')?;
+    let port = p.parse::<u16>().ok()?;
+    Some((h, port))
+}
+
+#[cfg(all(feature = "http", feature = "shadowsocks"))]
+fn decode_ss_userinfo(encoded: &str) -> Option<String> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+
+    let bytes = STANDARD
+        .decode(encoded)
+        .or_else(|_| STANDARD_NO_PAD.decode(encoded))
+        .or_else(|_| URL_SAFE.decode(encoded))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(encoded))
+        .ok()?;
+
+    String::from_utf8(bytes).ok()
+}
+
+#[cfg(all(not(feature = "http"), feature = "shadowsocks"))]
+fn decode_ss_userinfo(_encoded: &str) -> Option<String> {
+    None
 }
 
 /* JSON Parsing */
@@ -627,11 +726,11 @@ fn parse_base_config_from_json(value: &Value) -> Result<BaseProxyConfig, ParseEr
         config.set_auto_tls(auto_tls);
     }
 
-    if let Some(tls_value) = obj.get("tls_config") {
-        if !tls_value.is_null() {
-            let tls_config = parse_tls_config(tls_value)?;
-            config.set_tls_config(tls_config);
-        }
+    if let Some(tls_value) = obj.get("tls_config")
+        && !tls_value.is_null()
+    {
+        let tls_config = parse_tls_config(tls_value)?;
+        config.set_tls_config(tls_config);
     }
 
     Ok(config)
@@ -843,11 +942,11 @@ fn parse_tls_config(value: &Value) -> Result<TLSConfig, ParseError> {
     match config_type {
         "default" => {
             let mut config = TLSConfig::new();
-            if let Some(alpn_value) = obj.get("alpn") {
-                if !alpn_value.is_null() {
-                    let alpn = parse_tls_alpn(alpn_value)?;
-                    config = config.set_alpn(alpn);
-                }
+            if let Some(alpn_value) = obj.get("alpn")
+                && !alpn_value.is_null()
+            {
+                let alpn = parse_tls_alpn(alpn_value)?;
+                config = config.set_alpn(alpn);
             }
             Ok(config)
         }
@@ -972,5 +1071,55 @@ mod tests {
         let value: Value = serde_json::from_str(json).unwrap();
         let result = parse_proxy_json(&value);
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(all(feature = "shadowsocks", feature = "http"))]
+    fn parse_ss_base64_userinfo_url() {
+        let proxy = parse_proxy_url(
+            "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpxSm1qUUZQUG42TGJEWHdkRkxJeFd0@209.74.82.189:21520",
+        )
+        .unwrap()
+        .expect("expected shadowsocks proxy");
+
+        match proxy {
+            Proxy::Shadowsocks {
+                host,
+                port,
+                password,
+                config,
+            } => {
+                assert_eq!(host, "209.74.82.189");
+                assert_eq!(port, 21520);
+                assert_eq!(password, "qJmjQFPPn6LbDXwdFLIxWt");
+                assert_eq!(config.get_method(), "chacha20-ietf-poly1305");
+            }
+            _ => panic!("Expected Shadowsocks proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "shadowsocks", feature = "http"))]
+    fn parse_ss_legacy_full_blob_url() {
+        let proxy = parse_proxy_url(
+            "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpBUmd2R1p5d0ErZ2FjZ0dWMjZCdm11MDUrd1ptUlcvaitBZFUrWjhCdDQ0PUAxNDcuNzguMC4xODI6OTkw#tag",
+        )
+        .unwrap()
+        .expect("expected shadowsocks proxy");
+
+        match proxy {
+            Proxy::Shadowsocks {
+                host,
+                port,
+                password,
+                config,
+            } => {
+                assert_eq!(host, "147.78.0.182");
+                assert_eq!(port, 990);
+                assert_eq!(password, "ARGvGZywA+gacgGV26Bvmu05+wZmRW/j+AdU+Z8Bt44=");
+                assert_eq!(config.get_method(), "chacha20-ietf-poly1305");
+            }
+            _ => panic!("Expected Shadowsocks proxy"),
+        }
     }
 }

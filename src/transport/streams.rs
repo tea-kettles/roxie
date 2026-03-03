@@ -90,7 +90,7 @@ pub enum ProxyStream {
 
     /// Shadowsocks encrypted stream.
     #[cfg(feature = "shadowsocks")]
-    Shadowsocks(ShadowsocksStream),
+    Shadowsocks(Box<ShadowsocksStream>),
 }
 
 /* Implementations */
@@ -178,7 +178,7 @@ impl ProxyStream {
         master_key: Vec<u8>,
         method: CipherMethod,
     ) -> Self {
-        Self::Shadowsocks(ShadowsocksStream {
+        Self::Shadowsocks(Box::new(ShadowsocksStream {
             inner: stream,
             send_cipher,
             send_nonce,
@@ -193,7 +193,7 @@ impl ProxyStream {
             recv_raw: Vec::new(),
             recv_plain: Vec::new(),
             eof: false,
-        })
+        }))
     }
 
     /// Get a reference to the underlying TCP stream if this is TCP.
@@ -429,7 +429,7 @@ fn shadowsocks_poll_write(
         &mut stream.send_nonce,
         &buf[..chunk_len],
     )
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    .map_err(|e| io::Error::other(e.to_string()))?;
 
     stream.write_buf = encrypted;
     stream.write_pos = 0;
@@ -535,10 +535,10 @@ fn shadowsocks_poll_read(
         let salt: Vec<u8> = stream.recv_raw.drain(..salt_len).collect();
         let session_key =
             crate::protocols::shadowsocks::derive_session_key(&stream.master_key, &salt)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
         stream.recv_cipher = Some(
             AeadCipher::new(stream.method, &session_key)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?,
+                .map_err(|e| io::Error::other(e.to_string()))?,
         );
         stream.salt_received = true;
     }

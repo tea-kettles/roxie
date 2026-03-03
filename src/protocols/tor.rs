@@ -579,10 +579,10 @@ fn parse_cookie_path(protocol_info: &[String]) -> Option<String> {
     for line in protocol_info {
         if let Some(pos) = line.find("COOKIEFILE=\"") {
             let start = pos + "COOKIEFILE=\"".len();
-            if let Some(rest) = line.get(start..) {
-                if let Some(end) = rest.find('"') {
-                    return Some(rest[..end].to_string());
-                }
+            if let Some(rest) = line.get(start..)
+                && let Some(end) = rest.find('"')
+            {
+                return Some(rest[..end].to_string());
             }
         }
     }

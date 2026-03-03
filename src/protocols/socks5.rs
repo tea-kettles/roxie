@@ -300,10 +300,10 @@ async fn detect_protocol(
             .is_ok()
         {
             let all_bytes = [initial_bytes, &extra].concat();
-            if let Ok(s) = std::str::from_utf8(&all_bytes) {
-                if s.starts_with("HTTP/") {
-                    return "HTTP server".to_string();
-                }
+            if let Ok(s) = std::str::from_utf8(&all_bytes)
+                && s.starts_with("HTTP/")
+            {
+                return "HTTP server".to_string();
             }
         }
         return "HTTP-like response (starts with 'HT')".to_string();
@@ -324,7 +324,7 @@ async fn detect_protocol(
     }
 
     // Check for SOCKS4 version
-    if initial_bytes.len() >= 1 && initial_bytes[0] == 0x04 {
+    if !initial_bytes.is_empty() && initial_bytes[0] == 0x04 {
         return "SOCKS4 server (version 0x04)".to_string();
     }
 

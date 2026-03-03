@@ -8,12 +8,20 @@
 //! 2. HKDF-SHA1 for session key derivation
 //! 3. AEAD cipher with incrementing nonces
 //! 4. Chunk-based encoding (encrypted length + encrypted payload)
+//!
+//! DEV NOTE:
+//! - Scoped method support is currently feature-complete for:
+//!   `aes-128-gcm`, `aes-192-gcm`, `aes-256-gcm`,
+//!   `chacha20-ietf-poly1305`, and `xchacha20-ietf-poly1305`.
+//! - This scope is validated by live method-probe and live stress tests under `tests/`
+//!   (`live_shadowsocks_probe.rs`, `live_shadowsocks_stress.rs`) for this project environment.
 
 use aes_gcm::{
     Aes128Gcm, Aes256Gcm,
     aead::{AeadInPlace, KeyInit, generic_array::GenericArray},
 };
-use chacha20poly1305::ChaCha20Poly1305;
+use aes_gcm::aes::{Aes192, cipher::consts::U12};
+use chacha20poly1305::{ChaCha20Poly1305, XChaCha20Poly1305};
 use hkdf::Hkdf;
 use md5::compute;
 use rand::{RngCore, rngs::OsRng};
@@ -36,6 +44,7 @@ const ATYP_IPV6: u8 = 0x04;
 const TAG_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 pub(crate) const MAX_PAYLOAD: usize = 0x3FFF; // 16383 bytes
+type Aes192Gcm = aes_gcm::AesGcm<Aes192, U12>;
 
 /* Cipher Method */
 
@@ -44,10 +53,14 @@ pub(crate) const MAX_PAYLOAD: usize = 0x3FFF; // 16383 bytes
 pub enum CipherMethod {
     /// AES-128-GCM (16-byte key, 16-byte salt).
     Aes128Gcm,
+    /// AES-192-GCM (24-byte key, 24-byte salt).
+    Aes192Gcm,
     /// AES-256-GCM (32-byte key, 32-byte salt).
     Aes256Gcm,
     /// ChaCha20-Poly1305 (32-byte key, 32-byte salt).
     ChaCha20Poly1305,
+    /// XChaCha20-Poly1305 (32-byte key, 32-byte salt).
+    XChaCha20Poly1305,
     /// Legacy AES-128-CFB (16-byte key, 16-byte IV).
     Aes128Cfb,
     /// Legacy AES-192-CFB (24-byte key, 16-byte IV).
@@ -68,10 +81,12 @@ impl CipherMethod {
         match cipher.as_str() {
             // === Supported AEAD ciphers ===
             "aes-128-gcm" => Ok(Self::Aes128Gcm),
+            "aes-192-gcm" => Ok(Self::Aes192Gcm),
             "aes-256-gcm" => Ok(Self::Aes256Gcm),
 
             // ChaCha20 (both official Shadowsocks names)
             "chacha20-poly1305" | "chacha20-ietf-poly1305" => Ok(Self::ChaCha20Poly1305),
+            "xchacha20-poly1305" | "xchacha20-ietf-poly1305" => Ok(Self::XChaCha20Poly1305),
 
             // === Explicitly rejected legacy ciphers ===
             c if Self::is_legacy_cipher(c) => Err(ShadowsocksError::LegacyCipherNotSupported {
@@ -120,7 +135,8 @@ impl CipherMethod {
     pub fn key_len(&self) -> usize {
         match self {
             Self::Aes128Gcm => 16,
-            Self::Aes256Gcm | Self::ChaCha20Poly1305 => 32,
+            Self::Aes192Gcm => 24,
+            Self::Aes256Gcm | Self::ChaCha20Poly1305 | Self::XChaCha20Poly1305 => 32,
             Self::Aes128Cfb => 16,
             Self::Aes192Cfb => 24,
             Self::Aes256Cfb => 32,
@@ -133,7 +149,8 @@ impl CipherMethod {
     pub fn salt_len(&self) -> usize {
         match self {
             Self::Aes128Gcm => 16,
-            Self::Aes256Gcm | Self::ChaCha20Poly1305 => 32,
+            Self::Aes192Gcm => 24,
+            Self::Aes256Gcm | Self::ChaCha20Poly1305 | Self::XChaCha20Poly1305 => 32,
             // Legacy stream ciphers use IVs instead of salts; preserve typical lengths
             Self::Aes128Cfb | Self::Aes192Cfb | Self::Aes256Cfb | Self::Rc4Md5 => 16,
             Self::ChaCha20 => 12,
@@ -192,6 +209,12 @@ pub(crate) fn derive_session_key(master: &[u8], salt: &[u8]) -> Result<Vec<u8>, 
 #[derive(Clone, Copy, Debug)]
 pub struct Nonce(u128);
 
+impl Default for Nonce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Nonce {
     pub fn new() -> Self {
         Self(0)
@@ -217,8 +240,10 @@ impl Nonce {
 /// Runtime AEAD cipher instance.
 pub enum AeadCipher {
     Aes128(Aes128Gcm),
-    Aes256(Aes256Gcm),
+    Aes192(Box<Aes192Gcm>),
+    Aes256(Box<Aes256Gcm>),
     ChaCha(ChaCha20Poly1305),
+    XChaCha(XChaCha20Poly1305),
 }
 
 impl AeadCipher {
@@ -234,6 +259,16 @@ impl AeadCipher {
                 let key_arr = GenericArray::from_slice(key);
                 Ok(Self::Aes128(Aes128Gcm::new(key_arr)))
             }
+            CipherMethod::Aes192Gcm => {
+                if key.len() != 24 {
+                    return Err(ShadowsocksError::InvalidKeyLength {
+                        expected: 24,
+                        actual: key.len(),
+                    });
+                }
+                let key_arr = GenericArray::from_slice(key);
+                Ok(Self::Aes192(Box::new(Aes192Gcm::new(key_arr))))
+            }
             CipherMethod::Aes256Gcm => {
                 if key.len() != 32 {
                     return Err(ShadowsocksError::InvalidKeyLength {
@@ -242,7 +277,7 @@ impl AeadCipher {
                     });
                 }
                 let key_arr = GenericArray::from_slice(key);
-                Ok(Self::Aes256(Aes256Gcm::new(key_arr)))
+                Ok(Self::Aes256(Box::new(Aes256Gcm::new(key_arr))))
             }
             CipherMethod::ChaCha20Poly1305 => {
                 if key.len() != 32 {
@@ -253,6 +288,16 @@ impl AeadCipher {
                 }
                 let key_arr = GenericArray::from_slice(key);
                 Ok(Self::ChaCha(ChaCha20Poly1305::new(key_arr)))
+            }
+            CipherMethod::XChaCha20Poly1305 => {
+                if key.len() != 32 {
+                    return Err(ShadowsocksError::InvalidKeyLength {
+                        expected: 32,
+                        actual: key.len(),
+                    });
+                }
+                let key_arr = GenericArray::from_slice(key);
+                Ok(Self::XChaCha(XChaCha20Poly1305::new(key_arr)))
             }
             _ => Err(ShadowsocksError::LegacyCipherNotSupported {
                 method: method_string(method),
@@ -272,6 +317,11 @@ impl AeadCipher {
                 .map_err(|e| ShadowsocksError::EncryptionFailed {
                     reason: e.to_string(),
                 })?,
+            Self::Aes192(c) => c
+                .encrypt_in_place_detached(GenericArray::from_slice(nonce), &[], data)
+                .map_err(|e| ShadowsocksError::EncryptionFailed {
+                    reason: e.to_string(),
+                })?,
             Self::Aes256(c) => c
                 .encrypt_in_place_detached(GenericArray::from_slice(nonce), &[], data)
                 .map_err(|e| ShadowsocksError::EncryptionFailed {
@@ -282,6 +332,14 @@ impl AeadCipher {
                 .map_err(|e| ShadowsocksError::EncryptionFailed {
                     reason: e.to_string(),
                 })?,
+            Self::XChaCha(c) => {
+                let mut xnonce = [0u8; 24];
+                xnonce[..NONCE_LEN].copy_from_slice(nonce);
+                c.encrypt_in_place_detached(GenericArray::from_slice(&xnonce), &[], data)
+                    .map_err(|e| ShadowsocksError::EncryptionFailed {
+                        reason: e.to_string(),
+                    })?
+            }
         };
 
         let mut out = [0u8; TAG_LEN];
@@ -304,6 +362,11 @@ impl AeadCipher {
                 .map_err(|e| ShadowsocksError::DecryptionFailed {
                     reason: e.to_string(),
                 }),
+            Self::Aes192(c) => c
+                .decrypt_in_place_detached(GenericArray::from_slice(nonce), &[], data, tag_arr)
+                .map_err(|e| ShadowsocksError::DecryptionFailed {
+                    reason: e.to_string(),
+                }),
             Self::Aes256(c) => c
                 .decrypt_in_place_detached(GenericArray::from_slice(nonce), &[], data, tag_arr)
                 .map_err(|e| ShadowsocksError::DecryptionFailed {
@@ -314,6 +377,19 @@ impl AeadCipher {
                 .map_err(|e| ShadowsocksError::DecryptionFailed {
                     reason: e.to_string(),
                 }),
+            Self::XChaCha(c) => {
+                let mut xnonce = [0u8; 24];
+                xnonce[..NONCE_LEN].copy_from_slice(nonce);
+                c.decrypt_in_place_detached(
+                    GenericArray::from_slice(&xnonce),
+                    &[],
+                    data,
+                    tag_arr,
+                )
+                .map_err(|e| ShadowsocksError::DecryptionFailed {
+                    reason: e.to_string(),
+                })
+            }
         }
     }
 }
@@ -509,15 +585,7 @@ pub async fn establish_shadowsocks(
     .await;
 
     match result {
-        Ok(Ok(result)) => {
-            trace!(
-                target_url = %target_url,
-                proxy_addr = %proxy_addr,
-                elapsed_ms = start.elapsed().as_millis(),
-                "handshake complete"
-            );
-            Ok(result)
-        }
+        Ok(Ok(result)) => Ok(result),
         Ok(Err(e)) => {
             trace!(
                 target_url = %target_url,
@@ -682,20 +750,16 @@ async fn handshake(
 
     salt.zeroize();
 
-    trace!(
-        proxy_addr = %proxy_addr,
-        elapsed_ms = start.elapsed().as_millis(),
-        "handshake complete"
-    );
-
     Ok((cipher, nonce, master_key, method))
 }
 
 fn method_string(method: CipherMethod) -> String {
     match method {
         CipherMethod::Aes128Gcm => "aes-128-gcm",
+        CipherMethod::Aes192Gcm => "aes-192-gcm",
         CipherMethod::Aes256Gcm => "aes-256-gcm",
         CipherMethod::ChaCha20Poly1305 => "chacha20-ietf-poly1305",
+        CipherMethod::XChaCha20Poly1305 => "xchacha20-ietf-poly1305",
         CipherMethod::Aes128Cfb => "aes-128-cfb",
         CipherMethod::Aes192Cfb => "aes-192-cfb",
         CipherMethod::Aes256Cfb => "aes-256-cfb",
@@ -732,10 +796,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_aes_192_gcm() {
+        assert_eq!(
+            CipherMethod::parse("aes-192-gcm").unwrap(),
+            CipherMethod::Aes192Gcm
+        );
+    }
+
+    #[test]
     fn parse_chacha20_poly1305() {
         assert_eq!(
             CipherMethod::parse("chacha20-ietf-poly1305").unwrap(),
             CipherMethod::ChaCha20Poly1305
+        );
+    }
+
+    #[test]
+    fn parse_xchacha20_poly1305() {
+        assert_eq!(
+            CipherMethod::parse("xchacha20-ietf-poly1305").unwrap(),
+            CipherMethod::XChaCha20Poly1305
         );
     }
 
@@ -762,15 +842,19 @@ mod tests {
     #[test]
     fn key_lengths() {
         assert_eq!(CipherMethod::Aes128Gcm.key_len(), 16);
+        assert_eq!(CipherMethod::Aes192Gcm.key_len(), 24);
         assert_eq!(CipherMethod::Aes256Gcm.key_len(), 32);
         assert_eq!(CipherMethod::ChaCha20Poly1305.key_len(), 32);
+        assert_eq!(CipherMethod::XChaCha20Poly1305.key_len(), 32);
     }
 
     #[test]
     fn salt_lengths() {
         assert_eq!(CipherMethod::Aes128Gcm.salt_len(), 16);
+        assert_eq!(CipherMethod::Aes192Gcm.salt_len(), 24);
         assert_eq!(CipherMethod::Aes256Gcm.salt_len(), 32);
         assert_eq!(CipherMethod::ChaCha20Poly1305.salt_len(), 32);
+        assert_eq!(CipherMethod::XChaCha20Poly1305.salt_len(), 32);
     }
 
     #[test]

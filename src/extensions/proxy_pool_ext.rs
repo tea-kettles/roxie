@@ -4,7 +4,7 @@
 //! historical performance data to minimize latency.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::Semaphore;
@@ -12,7 +12,7 @@ use tracing::{debug, trace, warn};
 use url::Url;
 
 use crate::errors::ProxyError;
-use crate::transport::{Proxy, ProxyPool, ProxyStream};
+use crate::transport::{ProxyPool, ProxyStream};
 
 /* Types */
 
@@ -110,8 +110,8 @@ impl ProxyPoolExt for ProxyPool {
                     
                     // Update the pool based on real-time race results
                     match &res {
-                        Ok(_) => pool_ref.record_success(&proxy, attempt_start.elapsed()),
-                        Err(_) => pool_ref.record_failure(&proxy),
+                        Ok(_) => pool_ref.record_success(proxy, attempt_start.elapsed()),
+                        Err(_) => pool_ref.record_failure(proxy),
                     }
                     
                     Some((proxy, res))
@@ -181,7 +181,7 @@ impl ProxyPoolExt for ProxyPool {
         let mut proxies = Vec::new();
         for _ in 0..self.len() {
             if let Some(proxy) = self.sample(self.len()) {
-                self.unlock(&proxy);
+                self.unlock(proxy);
                 proxies.push(proxy);
                 if proxies.len() >= self.len() {
                     break;
@@ -210,7 +210,7 @@ impl ProxyPoolExt for ProxyPool {
                         Ok(_) => {
                             let elapsed = test_start.elapsed();
                             // Record success directly to the pool to establish initial ranking
-                            pool.record_success(&proxy, elapsed);
+                            pool.record_success(proxy, elapsed);
 
                             Some(ProxyTestResult {
                                 proxy_key,
@@ -220,7 +220,7 @@ impl ProxyPoolExt for ProxyPool {
                             })
                         }
                         Err(e) => {
-                            pool.record_failure(&proxy);
+                            pool.record_failure(proxy);
                             Some(ProxyTestResult {
                                 proxy_key,
                                 success: false,

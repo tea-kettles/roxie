@@ -74,11 +74,10 @@ impl ProxyList {
         info!("parsing proxy lines");
 
         let mut proxies = Vec::new();
-        let mut line_num = 0;
         let mut candidate_count = 0;
 
-        for line in lines_str.lines() {
-            line_num += 1;
+        for (index, line) in lines_str.lines().enumerate() {
+            let line_num = index + 1;
             let line = line.trim();
 
             if line.is_empty() || line.starts_with('#') {
