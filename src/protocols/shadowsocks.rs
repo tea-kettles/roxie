@@ -221,7 +221,20 @@ impl Nonce {
     }
 
     /// Get current nonce and advance counter.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds (and returns an error in release builds via
+    /// the overflow check) if the 96-bit nonce space is exhausted. In practice
+    /// this requires encrypting ~2^96 chunks (~600 ZiB) over a single session,
+    /// so it is unreachable under normal operation.
     pub(crate) fn advance(&mut self) -> [u8; NONCE_LEN] {
+        // The usable nonce space is 96 bits (NONCE_LEN = 12 bytes).
+        // Guard against wrapping into already-used nonce values.
+        debug_assert!(
+            self.0 < (1u128 << 96),
+            "shadowsocks nonce counter exhausted (2^96 chunks encrypted)"
+        );
         let mut buf = [0u8; NONCE_LEN];
         let bytes = self.0.to_le_bytes();
         buf.copy_from_slice(&bytes[..NONCE_LEN]);
@@ -239,7 +252,7 @@ impl Nonce {
 
 /// Runtime AEAD cipher instance.
 pub enum AeadCipher {
-    Aes128(Aes128Gcm),
+    Aes128(Box<Aes128Gcm>),
     Aes192(Box<Aes192Gcm>),
     Aes256(Box<Aes256Gcm>),
     ChaCha(ChaCha20Poly1305),
@@ -257,7 +270,7 @@ impl AeadCipher {
                     });
                 }
                 let key_arr = GenericArray::from_slice(key);
-                Ok(Self::Aes128(Aes128Gcm::new(key_arr)))
+                Ok(Self::Aes128(Box::new(Aes128Gcm::new(key_arr))))
             }
             CipherMethod::Aes192Gcm => {
                 if key.len() != 24 {

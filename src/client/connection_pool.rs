@@ -12,6 +12,7 @@ use parking_lot::RwLock;
 use tracing::{debug, trace, warn};
 use url::Url;
 
+use crate::errors::ProxyError;
 use crate::transport::{Proxy, ProxyPool, ProxyStream};
 
 /* Constants */
@@ -98,6 +99,26 @@ pub struct ProxyStats {
     pub idle_count: usize,
     pub active_count: usize,
     pub total_count: usize,
+}
+
+/// Typed errors returned by [`ConnectionPool::get`].
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectionPoolError {
+    /// No proxies were available from the backing [`ProxyPool`].
+    #[error("no proxies available")]
+    NoProxiesAvailable,
+
+    /// Per-proxy connection limit was reached for the computed key.
+    #[error("connection limit reached for proxy {proxy_key}")]
+    ConnectionLimitReached { proxy_key: String },
+
+    /// Proxy connection attempt failed.
+    #[error("failed to connect through proxy {proxy_key}: {source}")]
+    ConnectFailed {
+        proxy_key: String,
+        #[source]
+        source: ProxyError,
+    },
 }
 
 /// Unique identifier for a proxy+target combination.
@@ -344,10 +365,10 @@ impl ConnectionPool {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn get(&self, target: &Url) -> Result<PooledStream, String> {
+    pub async fn get(&self, target: &Url) -> Result<PooledStream, ConnectionPoolError> {
         // Select best proxy from the pool
         let proxy = self.proxy_pool.quick()
-            .ok_or_else(|| "No proxies available".to_string())?
+            .ok_or(ConnectionPoolError::NoProxiesAvailable)?
             .clone();
 
         let key = ProxyKey::new(&proxy, target);
@@ -398,10 +419,9 @@ impl ConnectionPool {
 
         if !can_create {
             self.proxy_pool.unlock(&proxy);
-            return Err(format!(
-                "Connection limit reached for proxy {}",
-                key.to_string()
-            ));
+            return Err(ConnectionPoolError::ConnectionLimitReached {
+                proxy_key: key.to_string(),
+            });
         }
 
         // Create new connection
@@ -458,7 +478,10 @@ impl ConnectionPool {
                     "connection failed"
                 );
 
-                Err(format!("Failed to connect: {}", e))
+                Err(ConnectionPoolError::ConnectFailed {
+                    proxy_key: key.to_string(),
+                    source: e,
+                })
             }
         }
     }

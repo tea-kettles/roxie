@@ -286,6 +286,9 @@ mod tests {
     #[tokio::test]
     async fn handshake_timeout() {
         use std::time::Duration;
+        // quinn (hysteria2) pulls in aws-lc-rs alongside ring; install ring
+        // explicitly so rustls can pick a provider without ambiguity.
+        let _ = rustls::crypto::ring::default_provider().install_default();
 
         let (client, _server) = tokio::io::duplex(1024);
         let config = TLSConfig::new().set_handshake_timeout(Duration::from_millis(1));

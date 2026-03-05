@@ -129,6 +129,15 @@ pub enum Proxy {
         password: String,
         config: Arc<ShadowsocksConfig>,
     },
+
+    /// Hysteria2 QUIC-based proxy.
+    #[cfg(feature = "hysteria2")]
+    Hysteria2 {
+        host: String,
+        port: u16,
+        password: String,
+        config: Arc<Hysteria2Config>,
+    },
 }
 
 /* Implementations */
@@ -235,6 +244,17 @@ impl Proxy {
                     .await
             }
 
+            #[cfg(feature = "hysteria2")]
+            Proxy::Hysteria2 {
+                host,
+                port,
+                password,
+                config,
+            } => {
+                self.connect_hysteria2(host, *port, password, config, destination)
+                    .await
+            }
+
             #[allow(unreachable_patterns)]
             _ => Err(ProxyError::UnsupportedProtocol {
                 scheme: self.get_scheme().to_string(),
@@ -269,38 +289,7 @@ impl Proxy {
 
         trace!(proxy_addr = proxy_addr, "HTTP handshake complete");
 
-        // Check if autotls is enabled and destination uses HTTPS
-        let base_config = config.get_base_config();
-        if base_config.is_auto_tls() && destination.scheme() == "https" {
-            trace!(
-                proxy_addr = proxy_addr,
-                target_host = destination.host_str(),
-                "autotls enabled, establishing TLS connection"
-            );
-
-            let target_host = destination
-                .host_str()
-                .ok_or(ProxyError::MissingTargetHost)?;
-
-            // Reuse caller-provided TLS settings when available; otherwise start from defaults
-            let tls_config = base_config.get_tls_config().cloned().unwrap_or_else(|| {
-                crate::config::TLSConfig::new()
-                    .set_handshake_timeout(base_config.get_handshake_timeout())
-            });
-
-            let tls_stream =
-                crate::transport::tls::establish_tls(stream, target_host, &tls_config).await?;
-
-            trace!(
-                proxy_addr = proxy_addr,
-                target_host = target_host,
-                "TLS handshake complete"
-            );
-
-            Ok(ProxyStream::Tls(Box::new(tls_stream)))
-        } else {
-            Ok(ProxyStream::Tcp(stream))
-        }
+        Self::wrap_tls_if_needed(stream, &proxy_addr, destination, config.get_base_config()).await
     }
 
     #[cfg(feature = "socks4")]
@@ -330,38 +319,7 @@ impl Proxy {
 
         trace!(proxy_addr = proxy_addr, "SOCKS4 handshake complete");
 
-        // Check if autotls is enabled and destination uses HTTPS
-        let base_config = config.get_base_config();
-        if base_config.is_auto_tls() && destination.scheme() == "https" {
-            trace!(
-                proxy_addr = proxy_addr,
-                target_host = destination.host_str(),
-                "autotls enabled, establishing TLS connection"
-            );
-
-            let target_host = destination
-                .host_str()
-                .ok_or(ProxyError::MissingTargetHost)?;
-
-            // Reuse caller-provided TLS settings when available; otherwise start from defaults
-            let tls_config = base_config.get_tls_config().cloned().unwrap_or_else(|| {
-                crate::config::TLSConfig::new()
-                    .set_handshake_timeout(base_config.get_handshake_timeout())
-            });
-
-            let tls_stream =
-                crate::transport::tls::establish_tls(stream, target_host, &tls_config).await?;
-
-            trace!(
-                proxy_addr = proxy_addr,
-                target_host = target_host,
-                "TLS handshake complete"
-            );
-
-            Ok(ProxyStream::Tls(Box::new(tls_stream)))
-        } else {
-            Ok(ProxyStream::Tcp(stream))
-        }
+        Self::wrap_tls_if_needed(stream, &proxy_addr, destination, config.get_base_config()).await
     }
 
     #[cfg(feature = "socks5")]
@@ -391,38 +349,7 @@ impl Proxy {
 
         trace!(proxy_addr = proxy_addr, "SOCKS5 handshake complete");
 
-        // Check if autotls is enabled and destination uses HTTPS
-        let base_config = config.get_base_config();
-        if base_config.is_auto_tls() && destination.scheme() == "https" {
-            trace!(
-                proxy_addr = proxy_addr,
-                target_host = destination.host_str(),
-                "autotls enabled, establishing TLS connection"
-            );
-
-            let target_host = destination
-                .host_str()
-                .ok_or(ProxyError::MissingTargetHost)?;
-
-            // Reuse caller-provided TLS settings when available; otherwise start from defaults
-            let tls_config = base_config.get_tls_config().cloned().unwrap_or_else(|| {
-                crate::config::TLSConfig::new()
-                    .set_handshake_timeout(base_config.get_handshake_timeout())
-            });
-
-            let tls_stream =
-                crate::transport::tls::establish_tls(stream, target_host, &tls_config).await?;
-
-            trace!(
-                proxy_addr = proxy_addr,
-                target_host = target_host,
-                "TLS handshake complete"
-            );
-
-            Ok(ProxyStream::Tls(Box::new(tls_stream)))
-        } else {
-            Ok(ProxyStream::Tcp(stream))
-        }
+        Self::wrap_tls_if_needed(stream, &proxy_addr, destination, config.get_base_config()).await
     }
 
     #[cfg(feature = "tor")]
@@ -453,38 +380,7 @@ impl Proxy {
 
         trace!(proxy_addr = proxy_addr, "tor handshake complete");
 
-        // Check if autotls is enabled and destination uses HTTPS
-        let base_config = config.get_base_config();
-        if base_config.is_auto_tls() && destination.scheme() == "https" {
-            trace!(
-                proxy_addr = proxy_addr,
-                target_host = destination.host_str(),
-                "autotls enabled, establishing TLS connection"
-            );
-
-            let target_host = destination
-                .host_str()
-                .ok_or(ProxyError::MissingTargetHost)?;
-
-            // Reuse caller-provided TLS settings when available; otherwise start from defaults
-            let tls_config = base_config.get_tls_config().cloned().unwrap_or_else(|| {
-                crate::config::TLSConfig::new()
-                    .set_handshake_timeout(base_config.get_handshake_timeout())
-            });
-
-            let tls_stream =
-                crate::transport::tls::establish_tls(stream, target_host, &tls_config).await?;
-
-            trace!(
-                proxy_addr = proxy_addr,
-                target_host = target_host,
-                "TLS handshake complete"
-            );
-
-            Ok(ProxyStream::Tls(Box::new(tls_stream)))
-        } else {
-            Ok(ProxyStream::Tcp(stream))
-        }
+        Self::wrap_tls_if_needed(stream, &proxy_addr, destination, config.get_base_config()).await
     }
 
     #[cfg(feature = "shadowsocks")]
@@ -521,9 +417,145 @@ impl Proxy {
 
         trace!(proxy_addr = proxy_addr, "shadowsocks handshake complete");
 
-        Ok(ProxyStream::from_shadowsocks(
+        let ss_stream = crate::transport::streams::ShadowsocksStream::new(
             stream, cipher, nonce, master_key, method,
-        ))
+        );
+
+        #[cfg(feature = "tls")]
+        if config.get_base_config().is_auto_tls() && destination.scheme() == "https" {
+            let target_host = destination.host_str().ok_or(ProxyError::MissingTargetHost)?;
+            let tls_config = config
+                .get_base_config()
+                .get_tls_config()
+                .cloned()
+                .unwrap_or_else(|| {
+                    crate::config::TLSConfig::new()
+                        .set_handshake_timeout(config.get_base_config().get_handshake_timeout())
+                });
+
+            trace!(
+                proxy_addr = proxy_addr,
+                target_host = target_host,
+                "autotls enabled, wrapping shadowsocks in TLS"
+            );
+
+            let tls_stream =
+                crate::transport::tls::establish_tls(ss_stream, target_host, &tls_config).await?;
+
+            trace!(
+                proxy_addr = proxy_addr,
+                target_host = target_host,
+                "TLS handshake complete over shadowsocks"
+            );
+
+            return Ok(ProxyStream::from_tls_shadowsocks(tls_stream));
+        }
+
+        Ok(ProxyStream::from_shadowsocks_stream(ss_stream))
+    }
+
+    #[cfg(feature = "hysteria2")]
+    async fn connect_hysteria2(
+        &self,
+        host: &str,
+        port: u16,
+        password: &str,
+        config: &Hysteria2Config,
+        destination: &Url,
+    ) -> Result<ProxyStream, ProxyError> {
+        trace!(
+            proxy_host = host,
+            proxy_port = port,
+            target_url = %destination,
+            "starting Hysteria2 connection"
+        );
+
+        let (send, recv, conn) =
+            protocols::hysteria2::establish_hysteria2(host, port, password, config, destination)
+                .await?;
+
+        trace!(
+            proxy_host = host,
+            proxy_port = port,
+            "Hysteria2 stream established"
+        );
+
+        let hy2_stream = crate::transport::streams::Hysteria2TcpStream::new(send, recv, conn);
+
+        #[cfg(feature = "tls")]
+        if config.get_base_config().is_auto_tls() && destination.scheme() == "https" {
+            let target_host = destination.host_str().ok_or(ProxyError::MissingTargetHost)?;
+            let tls_config = config
+                .get_base_config()
+                .get_tls_config()
+                .cloned()
+                .unwrap_or_else(|| {
+                    crate::config::TLSConfig::new()
+                        .set_handshake_timeout(config.get_base_config().get_handshake_timeout())
+                });
+
+            trace!(
+                proxy_host = host,
+                proxy_port = port,
+                target_host = target_host,
+                "autotls enabled, wrapping hysteria2 in TLS"
+            );
+
+            let tls_stream =
+                crate::transport::tls::establish_tls(hy2_stream, target_host, &tls_config).await?;
+
+            trace!(
+                proxy_host = host,
+                proxy_port = port,
+                target_host = target_host,
+                "TLS handshake complete over hysteria2"
+            );
+
+            return Ok(ProxyStream::from_tls_hysteria2(tls_stream));
+        }
+
+        Ok(ProxyStream::from_hysteria2_stream(hy2_stream))
+    }
+
+    /// Wraps a connected TCP stream in TLS when auto_tls is enabled and the destination is HTTPS.
+    ///
+    /// Returns [`ProxyStream::Tls`] when TLS is applied, or [`ProxyStream::Tcp`] otherwise.
+    async fn wrap_tls_if_needed(
+        stream: TcpStream,
+        proxy_addr: &str,
+        destination: &Url,
+        base_config: &BaseProxyConfig,
+    ) -> Result<ProxyStream, ProxyError> {
+        if base_config.is_auto_tls() && destination.scheme() == "https" {
+            trace!(
+                proxy_addr = proxy_addr,
+                target_host = destination.host_str(),
+                "autotls enabled, establishing TLS connection"
+            );
+
+            let target_host = destination
+                .host_str()
+                .ok_or(ProxyError::MissingTargetHost)?;
+
+            // Reuse caller-provided TLS settings when available; otherwise start from defaults
+            let tls_config = base_config.get_tls_config().cloned().unwrap_or_else(|| {
+                crate::config::TLSConfig::new()
+                    .set_handshake_timeout(base_config.get_handshake_timeout())
+            });
+
+            let tls_stream =
+                crate::transport::tls::establish_tls(stream, target_host, &tls_config).await?;
+
+            trace!(
+                proxy_addr = proxy_addr,
+                target_host = target_host,
+                "TLS handshake complete"
+            );
+
+            Ok(ProxyStream::Tls(Box::new(tls_stream)))
+        } else {
+            Ok(ProxyStream::Tcp(stream))
+        }
     }
 
     /// Returns the proxy host.
@@ -555,6 +587,8 @@ impl Proxy {
             Proxy::Tor { host, .. } => host,
             #[cfg(feature = "shadowsocks")]
             Proxy::Shadowsocks { host, .. } => host,
+            #[cfg(feature = "hysteria2")]
+            Proxy::Hysteria2 { host, .. } => host,
         }
     }
 
@@ -587,6 +621,8 @@ impl Proxy {
             Proxy::Tor { port, .. } => *port,
             #[cfg(feature = "shadowsocks")]
             Proxy::Shadowsocks { port, .. } => *port,
+            #[cfg(feature = "hysteria2")]
+            Proxy::Hysteria2 { port, .. } => *port,
         }
     }
 
@@ -625,6 +661,8 @@ impl Proxy {
             Proxy::Tor { .. } => "tor",
             #[cfg(feature = "shadowsocks")]
             Proxy::Shadowsocks { .. } => "shadowsocks",
+            #[cfg(feature = "hysteria2")]
+            Proxy::Hysteria2 { .. } => "hysteria2",
         }
     }
 
@@ -793,6 +831,23 @@ impl Proxy {
                 }
             }
 
+            #[cfg(feature = "hysteria2")]
+            Proxy::Hysteria2 {
+                host,
+                port,
+                password,
+                config,
+            } => {
+                let mut new_config = (*config).clone();
+                new_config.set_base_arc(base.clone());
+                Proxy::Hysteria2 {
+                    host,
+                    port,
+                    password,
+                    config: Arc::new(new_config),
+                }
+            }
+
             #[allow(unreachable_patterns)]
             _ => self,
         }
@@ -849,5 +904,154 @@ mod tests {
         assert_eq!(proxy.get_host(), "localhost");
         assert_eq!(proxy.get_port(), 1080);
         assert_eq!(proxy.get_scheme(), "socks5");
+    }
+
+    #[test]
+    #[cfg(feature = "http")]
+    fn https_proxy_scheme() {
+        let proxy = Proxy::HTTPS {
+            host: "proxy.com".to_string(),
+            port: 8443,
+            config: Arc::new(HTTPConfig::new("proxy.com", 8443)),
+        };
+        assert_eq!(proxy.get_scheme(), "https");
+        assert_eq!(proxy.get_host(), "proxy.com");
+        assert_eq!(proxy.get_port(), 8443);
+    }
+
+    #[test]
+    #[cfg(feature = "socks4")]
+    fn socks4_proxy_accessors() {
+        let proxy = Proxy::SOCKS4 {
+            host: "proxy.com".to_string(),
+            port: 1080,
+            config: Arc::new(SOCKS4Config::new("proxy.com", 1080)),
+        };
+        assert_eq!(proxy.get_host(), "proxy.com");
+        assert_eq!(proxy.get_port(), 1080);
+        assert_eq!(proxy.get_scheme(), "socks4");
+    }
+
+    #[test]
+    #[cfg(feature = "socks4")]
+    fn socks4a_proxy_accessors() {
+        let proxy = Proxy::SOCKS4A {
+            host: "proxy.com".to_string(),
+            port: 1080,
+            config: Arc::new(SOCKS4Config::new("proxy.com", 1080)),
+        };
+        assert_eq!(proxy.get_host(), "proxy.com");
+        assert_eq!(proxy.get_port(), 1080);
+        assert_eq!(proxy.get_scheme(), "socks4a");
+    }
+
+    #[test]
+    #[cfg(feature = "socks5")]
+    fn socks5h_proxy_accessors() {
+        let proxy = Proxy::SOCKS5H {
+            host: "proxy.com".to_string(),
+            port: 1080,
+            config: Arc::new(SOCKS5Config::new("proxy.com", 1080)),
+        };
+        assert_eq!(proxy.get_host(), "proxy.com");
+        assert_eq!(proxy.get_port(), 1080);
+        assert_eq!(proxy.get_scheme(), "socks5h");
+    }
+
+    #[test]
+    #[cfg(feature = "tor")]
+    fn tor_proxy_accessors() {
+        let proxy = Proxy::Tor {
+            host: "127.0.0.1".to_string(),
+            port: 9050,
+            config: Arc::new(TorConfig::new()),
+        };
+        assert_eq!(proxy.get_host(), "127.0.0.1");
+        assert_eq!(proxy.get_port(), 9050);
+        assert_eq!(proxy.get_scheme(), "tor");
+    }
+
+    #[test]
+    #[cfg(feature = "shadowsocks")]
+    fn shadowsocks_proxy_accessors() {
+        let proxy = Proxy::Shadowsocks {
+            host: "proxy.com".to_string(),
+            port: 8388,
+            password: "secret".to_string(),
+            config: Arc::new(ShadowsocksConfig::new()),
+        };
+        assert_eq!(proxy.get_host(), "proxy.com");
+        assert_eq!(proxy.get_port(), 8388);
+        assert_eq!(proxy.get_scheme(), "shadowsocks");
+    }
+
+    #[test]
+    #[cfg(feature = "hysteria2")]
+    fn hysteria2_proxy_accessors() {
+        let proxy = Proxy::Hysteria2 {
+            host: "proxy.com".to_string(),
+            port: 443,
+            password: "pass".to_string(),
+            config: Arc::new(Hysteria2Config::new()),
+        };
+        assert_eq!(proxy.get_host(), "proxy.com");
+        assert_eq!(proxy.get_port(), 443);
+        assert_eq!(proxy.get_scheme(), "hysteria2");
+    }
+
+    #[test]
+    #[cfg(feature = "http")]
+    fn with_base_config_updates_handshake_timeout() {
+        use std::time::Duration;
+        let proxy = Proxy::HTTP {
+            host: "proxy.com".to_string(),
+            port: 8080,
+            config: Arc::new(HTTPConfig::new("proxy.com", 8080)),
+        };
+        let mut base = BaseProxyConfig::new();
+        base.set_handshake_timeout(Duration::from_secs(42));
+        let configured = proxy.with_base_config(Arc::new(base));
+        match configured {
+            Proxy::HTTP { config, .. } => {
+                assert_eq!(
+                    config.get_base_config().get_handshake_timeout(),
+                    Duration::from_secs(42)
+                );
+            }
+            _ => panic!("expected HTTP proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "http")]
+    fn with_base_config_preserves_host_and_port() {
+        let proxy = Proxy::HTTP {
+            host: "proxy.com".to_string(),
+            port: 8080,
+            config: Arc::new(HTTPConfig::new("proxy.com", 8080)),
+        };
+        let base = BaseProxyConfig::new();
+        let configured = proxy.with_base_config(Arc::new(base));
+        assert_eq!(configured.get_host(), "proxy.com");
+        assert_eq!(configured.get_port(), 8080);
+    }
+
+    #[test]
+    #[cfg(feature = "socks5")]
+    fn with_base_config_works_for_socks5() {
+        let proxy = Proxy::SOCKS5 {
+            host: "proxy.com".to_string(),
+            port: 1080,
+            config: Arc::new(SOCKS5Config::new("proxy.com", 1080)),
+        };
+        let mut base = BaseProxyConfig::new();
+        base.set_tcp_nodelay(true);
+        let configured = proxy.with_base_config(Arc::new(base));
+        match configured {
+            Proxy::SOCKS5 { config, .. } => {
+                assert!(config.get_base_config().is_tcp_nodelay());
+            }
+            _ => panic!("expected SOCKS5 proxy"),
+        }
     }
 }

@@ -64,6 +64,8 @@ pub struct Hysteria2Config {
     connection_timeout: Duration,
     // Idle timeout before closing inactive connections.
     idle_timeout: Duration,
+    // Salamander obfuscation password; `None` means no obfuscation.
+    obfs_password: Option<String>,
 }
 
 /* Implementations */
@@ -101,6 +103,7 @@ impl Hysteria2Config {
             alpn: "h3".to_string(),
             connection_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(60),
+            obfs_password: None,
         }
     }
 
@@ -235,6 +238,45 @@ impl Hysteria2Config {
         self
     }
 
+    /// Enables Hysteria2 Salamander QUIC obfuscation with the given password.
+    ///
+    /// When set, every UDP datagram is XOR'd with a BLAKE3-derived keystream
+    /// whose seed is the first 8 bytes of the QUIC packet.  The server must be
+    /// configured with the same obfuscation password.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use roxie::config::Hysteria2Config;
+    ///
+    /// let config = Hysteria2Config::new()
+    ///     .set_obfs_password("hunter2");
+    ///
+    /// assert_eq!(config.get_obfs_password(), Some("hunter2"));
+    /// ```
+    pub fn set_obfs_password(mut self, password: impl Into<String>) -> Self {
+        self.obfs_password = Some(password.into());
+        self
+    }
+
+    /// Disables Salamander obfuscation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use roxie::config::Hysteria2Config;
+    ///
+    /// let config = Hysteria2Config::new()
+    ///     .set_obfs_password("hunter2")
+    ///     .clear_obfs_password();
+    ///
+    /// assert!(config.get_obfs_password().is_none());
+    /// ```
+    pub fn clear_obfs_password(mut self) -> Self {
+        self.obfs_password = None;
+        self
+    }
+
     /// Clears the configured SNI value.
     ///
     /// # Examples
@@ -309,6 +351,11 @@ impl Hysteria2Config {
     /// Returns the configured idle timeout.
     pub fn get_idle_timeout(&self) -> Duration {
         self.idle_timeout
+    }
+
+    /// Returns the Salamander obfuscation password, if configured.
+    pub fn get_obfs_password(&self) -> Option<&str> {
+        self.obfs_password.as_deref()
     }
 
     /// Returns a shared reference to the embedded base proxy configuration.

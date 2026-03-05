@@ -4,34 +4,12 @@
 # Cargo.lock is not committed for library crates
 Cargo.lock
 
-# ── Scraping output data (project root) ──────────────────────────────────────
-
-/proxies.json
-/artwork_tags.json
-/artwork_tags_1.json
-/artwork_tags_2.json
-/aryion_gallery_index.csv
-/last_gallery.html
-/last_page.html
-/json_skeleton.json
-
-# ── Scraping output data (tests/) ────────────────────────────────────────────
-
 # Live proxy fixture — contains real addresses, never commit
-/tests/proxies.json
-
-# Scraping dataset that ended up in tests/
-/tests/aryion_tags.csv
+/proxies
 
 # Export-import test artifacts written to disk during test runs
-/tests/exported_proxies.json
-/tests/exported_proxies_custom.json
-/tests/exported_proxies_shared.json
+/tests/ignored
 
-# ── Scraping example programs (examples/) ────────────────────────────────────
-
-/examples/scrape_gallery_tags.rs
-/examples/scrape_main_gallery.rs
-/examples/scrape_tags.rs
-/examples/geolocate_access.rs
-/examples/honeypot_probe.rs
+# Style Guide
+STYLE_GUIDE2.MD
+TODO.MD

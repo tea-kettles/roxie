@@ -32,6 +32,13 @@ sha1 = { version = "0.10.6", optional = true }
 rustls-pki-types = "1.13.1"
 futures = "0.3.31"
 
+# QUIC / Hysteria2
+quinn = { version = "0.11", features = ["rustls"], optional = true }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
+http = { version = "1", optional = true }
+blake3 = { version = "1", optional = true }
+
 [dev-dependencies]
 scraper = "0.25.0"
 tempfile = "3.24.0"
@@ -40,12 +47,54 @@ tracing-subscriber = "0.3.22"
 [features]
 default = ["http", "socks4", "socks5", "tls", "all"]
 all = ["http", "socks4", "socks5", "tls", "hysteria2", "shadowsocks", "vmess", "tor", "trojan"]
-http = ["base64", "url"]
-socks4 = ["url"]
-socks5 = ["url"]
-tls = ["tokio-rustls", "rustls", "webpki-roots"]
-shadowsocks = ["aes-gcm", "chacha20poly1305", "hkdf", "md5", "sha1"]
-hysteria2 = []
+http = ["dep:base64", "dep:url"]
+socks4 = ["dep:url"]
+socks5 = ["dep:url"]
+tls = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
+shadowsocks = ["dep:aes-gcm", "dep:chacha20poly1305", "dep:hkdf", "dep:md5", "dep:sha1"]
+hysteria2 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:http", "dep:url", "dep:blake3", "tls"]
 tor = ["socks5"]
 vmess = []
 trojan = []
+
+# ── Live / ignored integration tests ────────────────────────────────────────
+# All tests inside these files are #[ignore] – they require external
+# network access (real proxies, Tor, TLS endpoints, etc.).
+# Run a specific one with:
+#   cargo test --test <name> -- --ignored --nocapture
+
+[[test]]
+name = "live_proxylist_connect"
+path = "tests/ignored/live_proxylist_connect.rs"
+
+[[test]]
+name = "live_tls_connect"
+path = "tests/ignored/live_tls_connect.rs"
+
+[[test]]
+name = "live_tor_connect"
+path = "tests/ignored/live_tor_connect.rs"
+
+[[test]]
+name = "live_hysteria2_probe"
+path = "tests/ignored/live_hysteria2_probe.rs"
+
+[[test]]
+name = "live_shadowsocks_probe"
+path = "tests/ignored/live_shadowsocks_probe.rs"
+
+[[test]]
+name = "live_shadowsocks_public_endpoints"
+path = "tests/ignored/live_shadowsocks_public_endpoints.rs"
+
+[[test]]
+name = "live_shadowsocks_stress"
+path = "tests/ignored/live_shadowsocks_stress.rs"
+
+[[test]]
+name = "live_shadowsocks_cleanup_ebrasha"
+path = "tests/ignored/live_shadowsocks_cleanup_ebrasha.rs"
+
+[[test]]
+name = "live_mass_proxy_test"
+path = "tests/ignored/live_mass_proxy_test.rs"

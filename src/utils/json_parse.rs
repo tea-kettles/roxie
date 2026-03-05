@@ -24,6 +24,8 @@ const DEFAULT_SOCKS4_PORT: u16 = 1080;
 const DEFAULT_SOCKS5_PORT: u16 = 1080;
 const DEFAULT_TOR_PORT: u16 = 9050;
 const DEFAULT_SHADOWSOCKS_PORT: u16 = 8388;
+#[cfg(feature = "hysteria2")]
+const DEFAULT_HYSTERIA2_PORT: u16 = 443;
 
 /* URL Parsing */
 
@@ -188,6 +190,69 @@ pub fn parse_proxy_url(url_str: &str) -> Result<Option<Proxy>, ParseError> {
             }))
         }
 
+        #[cfg(feature = "hysteria2")]
+        "hysteria2" | "hy2" => {
+            // hysteria2://password@host:port?sni=...&insecure=1&upmbps=10&downmbps=50
+            // The password is in the username position; there is no URL password.
+            let password = match (username.as_deref(), password.as_deref()) {
+                (Some(u), None) if !u.is_empty() => u.to_string(),
+                (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => {
+                    // Some clients encode as user:pass — treat the whole thing as password.
+                    format!("{}:{}", u, p)
+                }
+                _ => {
+                    return Err(ParseError::MissingField {
+                        field: "password (hysteria2 expects password@host:port)".to_string(),
+                    });
+                }
+            };
+
+            let mut config = Hysteria2Config::new();
+            let mut obfs_type: Option<String> = None;
+            let mut obfs_password_param: Option<String> = None;
+
+            // Parse optional query parameters.
+            for (key, value) in url.query_pairs() {
+                match key.as_ref() {
+                    "sni" => config = config.set_sni(value.as_ref()),
+                    "insecure" => {
+                        config = config.set_skip_cert_verify(value == "1" || value == "true")
+                    }
+                    "upmbps" => {
+                        if let Ok(v) = value.parse::<u32>() {
+                            let down = config.get_down_mbps();
+                            config = config.set_bandwidth(v, down);
+                        }
+                    }
+                    "downmbps" => {
+                        if let Ok(v) = value.parse::<u32>() {
+                            let up = config.get_up_mbps();
+                            config = config.set_bandwidth(up, v);
+                        }
+                    }
+                    "cc" => config = config.set_congestion_control(value.as_ref()),
+                    "obfs" => obfs_type = Some(value.into_owned()),
+                    "obfs-password" => obfs_password_param = Some(value.into_owned()),
+                    _ => {}
+                }
+            }
+
+            // Enable Salamander obfuscation when requested.  When no explicit
+            // obfs-password is provided the auth password doubles as the obfs
+            // password (standard Hysteria2 client behaviour).
+            if obfs_type.as_deref() == Some("salamander") {
+                let obfs_pw = obfs_password_param.unwrap_or_else(|| password.clone());
+                config = config.set_obfs_password(obfs_pw);
+            }
+
+            Ok(Some(Proxy::Hysteria2 {
+                host,
+                port,
+                password,
+                config: Arc::new(config),
+            }))
+        }
+
         _ => {
             warn!(scheme = scheme, "unsupported scheme, skipping");
             Err(ParseError::UnsupportedScheme {
@@ -205,6 +270,8 @@ fn default_port_for_scheme(scheme: &str) -> u16 {
         "socks5" | "socks5h" => DEFAULT_SOCKS5_PORT,
         "tor" => DEFAULT_TOR_PORT,
         "shadowsocks" | "ss" => DEFAULT_SHADOWSOCKS_PORT,
+        #[cfg(feature = "hysteria2")]
+        "hysteria2" | "hy2" => DEFAULT_HYSTERIA2_PORT,
         _ => 8080, // Fallback
     }
 }
@@ -259,16 +326,15 @@ fn parse_shadowsocks_url_credentials(
 
     // Legacy SIP002 variant:
     // ss://BASE64(method:password@host:port)#tag
-    if let Some(decoded) = decode_ss_userinfo(host) {
-        if let Some((creds, host_port)) = decoded.rsplit_once('@')
-            && let Some((method, pass)) = creds.split_once(':')
-            && let Some((decoded_host, decoded_port)) = split_host_port(host_port)
-            && !method.is_empty()
-            && !pass.is_empty()
-        {
-            let config = ShadowsocksConfig::new().set_method(method);
-            return Ok((decoded_host.to_string(), decoded_port, pass.to_string(), config));
-        }
+    if let Some(decoded) = decode_ss_userinfo(host)
+        && let Some((creds, host_port)) = decoded.rsplit_once('@')
+        && let Some((method, pass)) = creds.split_once(':')
+        && let Some((decoded_host, decoded_port)) = split_host_port(host_port)
+        && !method.is_empty()
+        && !pass.is_empty()
+    {
+        let config = ShadowsocksConfig::new().set_method(method);
+        return Ok((decoded_host.to_string(), decoded_port, pass.to_string(), config));
     }
 
     Err(ParseError::MissingField {
@@ -542,6 +608,29 @@ pub fn parse_proxy_json(value: &Value) -> Result<Option<Proxy>, ParseError> {
             }
 
             Ok(Some(Proxy::Shadowsocks {
+                host,
+                port,
+                password,
+                config: Arc::new(config),
+            }))
+        }
+
+        #[cfg(feature = "hysteria2")]
+        "hysteria2" | "hy2" => {
+            let password = password.clone().ok_or_else(|| ParseError::MissingField {
+                field: "password".to_string(),
+            })?;
+
+            let mut config = if let Some(cfg) = config_value {
+                parse_hysteria2_config(cfg)?
+            } else {
+                Hysteria2Config::new()
+            };
+            if let Some(base) = base_value {
+                apply_base_config(&mut config, base)?;
+            }
+
+            Ok(Some(Proxy::Hysteria2 {
                 host,
                 port,
                 password,
@@ -856,6 +945,50 @@ fn parse_shadowsocks_config(value: &Value) -> Result<ShadowsocksConfig, ParseErr
     Ok(config)
 }
 
+#[cfg(feature = "hysteria2")]
+fn parse_hysteria2_config(value: &Value) -> Result<Hysteria2Config, ParseError> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| ParseError::InvalidJsonStructure {
+            expected: "object".to_string(),
+            found: value_type_name(value),
+        })?;
+
+    let mut config = Hysteria2Config::new();
+
+    if let Some(up) = obj.get("up_mbps").and_then(|v| v.as_u64()) {
+        let down = config.get_down_mbps();
+        config = config.set_bandwidth(up as u32, down);
+    }
+
+    if let Some(down) = obj.get("down_mbps").and_then(|v| v.as_u64()) {
+        let up = config.get_up_mbps();
+        config = config.set_bandwidth(up, down as u32);
+    }
+
+    if let Some(cc) = obj.get("congestion_control").and_then(|v| v.as_str()) {
+        config = config.set_congestion_control(cc);
+    }
+
+    if let Some(sni) = obj.get("sni").and_then(|v| v.as_str()) {
+        config = config.set_sni(sni);
+    }
+
+    if let Some(skip) = obj.get("skip_cert_verify").and_then(|v| v.as_bool()) {
+        config = config.set_skip_cert_verify(skip);
+    }
+
+    if let Some(alpn) = obj.get("alpn").and_then(|v| v.as_str()) {
+        config = config.set_alpn(alpn);
+    }
+
+    if let Some(obfs_password) = obj.get("obfs_password").and_then(|v| v.as_str()) {
+        config = config.set_obfs_password(obfs_password);
+    }
+
+    Ok(config)
+}
+
 fn apply_base_config<T: HasBaseProxyConfig>(
     config: &mut T,
     value: &Value,
@@ -1116,10 +1249,558 @@ mod tests {
             } => {
                 assert_eq!(host, "147.78.0.182");
                 assert_eq!(port, 990);
-                assert_eq!(password, "ARGvGZywA+gacgGV26Bvmu05+wZmRW/j+AdU+Z8Bt44=");
+                assert_eq!(password, "ARgvGZywA+gacgGV26Bvmu05+wZmRW/j+AdU+Z8Bt44=");
                 assert_eq!(config.get_method(), "chacha20-ietf-poly1305");
             }
             _ => panic!("Expected Shadowsocks proxy"),
         }
+    }
+
+    // ── URL parsing – all scheme variants ────────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "http")]
+    fn parse_https_url() {
+        let proxy = parse_proxy_url("https://user:pass@proxy.com:8443").unwrap().unwrap();
+        match proxy {
+            Proxy::HTTPS { host, port, .. } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 8443);
+            }
+            _ => panic!("expected HTTPS proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "http")]
+    fn parse_http_url_no_port_uses_default() {
+        let proxy = parse_proxy_url("http://proxy.com").unwrap().unwrap();
+        match proxy {
+            Proxy::HTTP { port, .. } => assert_eq!(port, 8080),
+            _ => panic!("expected HTTP proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "http")]
+    fn parse_http_url_no_credentials() {
+        let proxy = parse_proxy_url("http://proxy.com:8080").unwrap().unwrap();
+        assert_eq!(proxy.get_host(), "proxy.com");
+        assert_eq!(proxy.get_port(), 8080);
+    }
+
+    #[test]
+    #[cfg(feature = "socks4")]
+    fn parse_socks4_url() {
+        let proxy = parse_proxy_url("socks4://proxy.com:1080").unwrap().unwrap();
+        match proxy {
+            Proxy::SOCKS4 { host, port, .. } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 1080);
+            }
+            _ => panic!("expected SOCKS4 proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "socks4")]
+    fn parse_socks4_url_with_user_id() {
+        let proxy = parse_proxy_url("socks4://myuser@proxy.com:1080").unwrap().unwrap();
+        match proxy {
+            Proxy::SOCKS4 { host, port, config } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 1080);
+                assert_eq!(config.get_user_id(), Some("myuser"));
+            }
+            _ => panic!("expected SOCKS4 proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "socks4")]
+    fn parse_socks4_url_no_port_uses_default() {
+        let proxy = parse_proxy_url("socks4://proxy.com").unwrap().unwrap();
+        match proxy {
+            Proxy::SOCKS4 { port, .. } => assert_eq!(port, 1080),
+            _ => panic!("expected SOCKS4 proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "socks4")]
+    fn parse_socks4a_url() {
+        let proxy = parse_proxy_url("socks4a://proxy.com:1080").unwrap().unwrap();
+        match proxy {
+            Proxy::SOCKS4A { host, port, .. } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 1080);
+            }
+            _ => panic!("expected SOCKS4A proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "socks5")]
+    fn parse_socks5_url_no_credentials() {
+        let proxy = parse_proxy_url("socks5://proxy.com:1080").unwrap().unwrap();
+        match proxy {
+            Proxy::SOCKS5 { host, port, .. } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 1080);
+            }
+            _ => panic!("expected SOCKS5 proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "socks5")]
+    fn parse_socks5h_url() {
+        let proxy = parse_proxy_url("socks5h://user:pass@proxy.com:1080").unwrap().unwrap();
+        match proxy {
+            Proxy::SOCKS5H { host, port, .. } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 1080);
+            }
+            _ => panic!("expected SOCKS5H proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "socks5")]
+    fn parse_socks5_url_no_port_uses_default() {
+        let proxy = parse_proxy_url("socks5://proxy.com").unwrap().unwrap();
+        match proxy {
+            Proxy::SOCKS5 { port, .. } => assert_eq!(port, 1080),
+            _ => panic!("expected SOCKS5 proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tor")]
+    fn parse_tor_url() {
+        let proxy = parse_proxy_url("tor://127.0.0.1:9050").unwrap().unwrap();
+        match proxy {
+            Proxy::Tor { host, port, .. } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 9050);
+            }
+            _ => panic!("expected Tor proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tor")]
+    fn parse_tor_url_no_port_uses_default() {
+        let proxy = parse_proxy_url("tor://127.0.0.1").unwrap().unwrap();
+        match proxy {
+            Proxy::Tor { port, .. } => assert_eq!(port, 9050),
+            _ => panic!("expected Tor proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "hysteria2")]
+    fn parse_hysteria2_url_basic() {
+        let proxy = parse_proxy_url("hysteria2://mypassword@proxy.com:443").unwrap().unwrap();
+        match proxy {
+            Proxy::Hysteria2 { host, port, password, .. } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 443);
+                assert_eq!(password, "mypassword");
+            }
+            _ => panic!("expected Hysteria2 proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "hysteria2")]
+    fn parse_hy2_scheme_alias() {
+        let proxy = parse_proxy_url("hy2://mypassword@proxy.com:443").unwrap().unwrap();
+        match proxy {
+            Proxy::Hysteria2 { host, port, password, .. } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 443);
+                assert_eq!(password, "mypassword");
+            }
+            _ => panic!("expected Hysteria2 proxy from hy2:// alias"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "hysteria2")]
+    fn parse_hysteria2_url_no_port_uses_default() {
+        let proxy = parse_proxy_url("hysteria2://mypassword@proxy.com").unwrap().unwrap();
+        match proxy {
+            Proxy::Hysteria2 { port, .. } => assert_eq!(port, 443),
+            _ => panic!("expected Hysteria2 proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "hysteria2")]
+    fn parse_hysteria2_url_with_sni_and_insecure() {
+        let proxy = parse_proxy_url(
+            "hysteria2://pass@proxy.com:8443?sni=my.host.com&insecure=1",
+        )
+        .unwrap()
+        .unwrap();
+        match proxy {
+            Proxy::Hysteria2 { config, .. } => {
+                assert_eq!(config.get_sni(), Some("my.host.com"));
+                assert!(config.is_skip_cert_verify());
+            }
+            _ => panic!("expected Hysteria2 proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "hysteria2")]
+    fn parse_hysteria2_url_with_bandwidth_params() {
+        let proxy = parse_proxy_url(
+            "hysteria2://pass@proxy.com:443?upmbps=20&downmbps=100",
+        )
+        .unwrap()
+        .unwrap();
+        match proxy {
+            Proxy::Hysteria2 { config, .. } => {
+                assert_eq!(config.get_up_mbps(), 20);
+                assert_eq!(config.get_down_mbps(), 100);
+            }
+            _ => panic!("expected Hysteria2 proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "hysteria2")]
+    fn parse_hysteria2_url_with_salamander_obfs() {
+        let proxy = parse_proxy_url(
+            "hysteria2://authpass@proxy.com:443?obfs=salamander&obfs-password=obfspass",
+        )
+        .unwrap()
+        .unwrap();
+        match proxy {
+            Proxy::Hysteria2 { password, config, .. } => {
+                assert_eq!(password, "authpass");
+                assert_eq!(config.get_obfs_password(), Some("obfspass"));
+            }
+            _ => panic!("expected Hysteria2 proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "hysteria2")]
+    fn parse_hysteria2_url_salamander_falls_back_to_auth_password() {
+        // When obfs=salamander but no obfs-password, auth password is used as obfs password.
+        let proxy = parse_proxy_url(
+            "hysteria2://mypass@proxy.com:443?obfs=salamander",
+        )
+        .unwrap()
+        .unwrap();
+        match proxy {
+            Proxy::Hysteria2 { password, config, .. } => {
+                assert_eq!(password, "mypass");
+                assert_eq!(config.get_obfs_password(), Some("mypass"));
+            }
+            _ => panic!("expected Hysteria2 proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "hysteria2")]
+    fn parse_hysteria2_url_missing_password_is_error() {
+        // hysteria2 requires password in userinfo position.
+        let result = parse_proxy_url("hysteria2://proxy.com:443");
+        assert!(result.is_err(), "missing password should return Err");
+    }
+
+    // ── JSON parsing – all scheme variants ───────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "http")]
+    fn parse_https_json() {
+        let json = r#"{"protocol":"https","host":"proxy.com","port":8443}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let proxy = parse_proxy_json(&value).unwrap().unwrap();
+        match proxy {
+            Proxy::HTTPS { host, port, .. } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 8443);
+            }
+            _ => panic!("expected HTTPS proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "socks4")]
+    fn parse_socks4_json() {
+        let json = r#"{"protocol":"socks4","host":"proxy.com","port":1080}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let proxy = parse_proxy_json(&value).unwrap().unwrap();
+        match proxy {
+            Proxy::SOCKS4 { host, port, .. } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 1080);
+            }
+            _ => panic!("expected SOCKS4 proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "socks4")]
+    fn parse_socks4a_json() {
+        let json = r#"{"protocol":"socks4a","host":"proxy.com","port":1080}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let proxy = parse_proxy_json(&value).unwrap().unwrap();
+        match proxy {
+            Proxy::SOCKS4A { host, port, .. } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 1080);
+            }
+            _ => panic!("expected SOCKS4A proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "socks5")]
+    fn parse_socks5_json() {
+        let json = r#"{"protocol":"socks5","host":"proxy.com","port":1080,"username":"u","password":"p"}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let proxy = parse_proxy_json(&value).unwrap().unwrap();
+        match proxy {
+            Proxy::SOCKS5 { host, port, .. } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 1080);
+            }
+            _ => panic!("expected SOCKS5 proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "socks5")]
+    fn parse_socks5h_json() {
+        let json = r#"{"protocol":"socks5h","host":"proxy.com","port":1080}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let proxy = parse_proxy_json(&value).unwrap().unwrap();
+        match proxy {
+            Proxy::SOCKS5H { host, port, .. } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 1080);
+            }
+            _ => panic!("expected SOCKS5H proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tor")]
+    fn parse_tor_json() {
+        let json = r#"{"protocol":"tor","host":"127.0.0.1","port":9050}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let proxy = parse_proxy_json(&value).unwrap().unwrap();
+        match proxy {
+            Proxy::Tor { host, port, .. } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 9050);
+            }
+            _ => panic!("expected Tor proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "shadowsocks")]
+    fn parse_shadowsocks_json() {
+        let json = r#"{"protocol":"shadowsocks","host":"proxy.com","port":8388,"password":"secret"}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let proxy = parse_proxy_json(&value).unwrap().unwrap();
+        match proxy {
+            Proxy::Shadowsocks { host, port, password, .. } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 8388);
+                assert_eq!(password, "secret");
+            }
+            _ => panic!("expected Shadowsocks proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "shadowsocks")]
+    fn parse_ss_alias_json() {
+        let json = r#"{"protocol":"ss","host":"proxy.com","port":8388,"password":"secret"}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let proxy = parse_proxy_json(&value).unwrap().unwrap();
+        match proxy {
+            Proxy::Shadowsocks { .. } => {}
+            _ => panic!("expected Shadowsocks proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "shadowsocks")]
+    fn parse_shadowsocks_json_missing_password_is_error() {
+        let json = r#"{"protocol":"shadowsocks","host":"proxy.com","port":8388}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let result = parse_proxy_json(&value);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "hysteria2")]
+    fn parse_hysteria2_json() {
+        let json = r#"{"protocol":"hysteria2","host":"proxy.com","port":443,"password":"mypass"}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let proxy = parse_proxy_json(&value).unwrap().unwrap();
+        match proxy {
+            Proxy::Hysteria2 { host, port, password, .. } => {
+                assert_eq!(host, "proxy.com");
+                assert_eq!(port, 443);
+                assert_eq!(password, "mypass");
+            }
+            _ => panic!("expected Hysteria2 proxy"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "hysteria2")]
+    fn parse_hy2_alias_json() {
+        let json = r#"{"protocol":"hy2","host":"proxy.com","port":443,"password":"mypass"}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let proxy = parse_proxy_json(&value).unwrap().unwrap();
+        match proxy {
+            Proxy::Hysteria2 { .. } => {}
+            _ => panic!("expected Hysteria2 proxy"),
+        }
+    }
+
+    #[test]
+    fn parse_json_not_an_object_is_error() {
+        let value: serde_json::Value = serde_json::from_str(r#"["array"]"#).unwrap();
+        let result = parse_proxy_json(&value);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_json_unsupported_protocol_is_error() {
+        let json = r#"{"protocol":"ftp","host":"proxy.com","port":21}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let result = parse_proxy_json(&value);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_json_port_defaults_when_missing() {
+        // When port is absent the default for the scheme must be used.
+        #[cfg(feature = "http")]
+        {
+            let json = r#"{"protocol":"http","host":"proxy.com"}"#;
+            let value: serde_json::Value = serde_json::from_str(json).unwrap();
+            let proxy = parse_proxy_json(&value).unwrap().unwrap();
+            assert_eq!(proxy.get_port(), 8080);
+        }
+    }
+
+    // ── parse_proxy_list_json (grouped format) ────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "http")]
+    fn parse_proxy_list_json_grouped_format() {
+        let json = r#"{
+            "configs": [
+                {
+                    "base": {
+                        "handshake_timeout": 10,
+                        "phase_timeout": 5,
+                        "resolve_locally": false,
+                        "tcp_nodelay": true,
+                        "auto_tls": true
+                    },
+                    "proxies": [
+                        {"protocol": "http", "host": "proxy1.com", "port": 8080},
+                        {"protocol": "http", "host": "proxy2.com", "port": 8080}
+                    ]
+                }
+            ]
+        }"#;
+        let proxies = parse_proxy_list_json(json).unwrap();
+        assert_eq!(proxies.len(), 2);
+        assert_eq!(proxies[0].get_host(), "proxy1.com");
+        assert_eq!(proxies[1].get_host(), "proxy2.com");
+    }
+
+    #[test]
+    #[cfg(all(feature = "http", feature = "socks5"))]
+    fn parse_proxy_list_json_multiple_groups() {
+        let json = r#"{
+            "configs": [
+                {
+                    "base": {"handshake_timeout": 10, "phase_timeout": 5, "resolve_locally": false, "tcp_nodelay": false, "auto_tls": false},
+                    "proxies": [
+                        {"protocol": "http", "host": "proxy1.com", "port": 8080}
+                    ]
+                },
+                {
+                    "base": {"handshake_timeout": 20, "phase_timeout": 10, "resolve_locally": true, "tcp_nodelay": true, "auto_tls": false},
+                    "proxies": [
+                        {"protocol": "socks5", "host": "proxy2.com", "port": 1080}
+                    ]
+                }
+            ]
+        }"#;
+        let proxies = parse_proxy_list_json(json).unwrap();
+        assert_eq!(proxies.len(), 2);
+        assert_eq!(proxies[0].get_scheme(), "http");
+        assert_eq!(proxies[1].get_scheme(), "socks5");
+    }
+
+    #[test]
+    fn parse_proxy_list_json_missing_configs_is_error() {
+        let json = r#"{"proxies": []}"#;
+        let result = parse_proxy_list_json(json);
+        assert!(result.is_err());
+    }
+
+    // ── Default port mapping ──────────────────────────────────────────────────
+
+    #[test]
+    fn default_port_http() {
+        assert_eq!(default_port_for_scheme("http"), 8080);
+    }
+
+    #[test]
+    fn default_port_https() {
+        assert_eq!(default_port_for_scheme("https"), 8443);
+    }
+
+    #[test]
+    fn default_port_socks4() {
+        assert_eq!(default_port_for_scheme("socks4"), 1080);
+        assert_eq!(default_port_for_scheme("socks4a"), 1080);
+    }
+
+    #[test]
+    fn default_port_socks5() {
+        assert_eq!(default_port_for_scheme("socks5"), 1080);
+        assert_eq!(default_port_for_scheme("socks5h"), 1080);
+    }
+
+    #[test]
+    fn default_port_tor() {
+        assert_eq!(default_port_for_scheme("tor"), 9050);
+    }
+
+    #[test]
+    fn default_port_shadowsocks() {
+        assert_eq!(default_port_for_scheme("shadowsocks"), 8388);
+        assert_eq!(default_port_for_scheme("ss"), 8388);
+    }
+
+    #[test]
+    #[cfg(feature = "hysteria2")]
+    fn default_port_hysteria2() {
+        assert_eq!(default_port_for_scheme("hysteria2"), 443);
+        assert_eq!(default_port_for_scheme("hy2"), 443);
+    }
+
+    #[test]
+    fn default_port_unknown_falls_back() {
+        assert_eq!(default_port_for_scheme("unknown"), 8080);
     }
 }
