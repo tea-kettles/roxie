@@ -1,7 +1,7 @@
 //! JSON export utilities for proxy configurations.
 //!
 //! This module provides functionality to convert [`Proxy`] enum variants into their
-//! corresponding JSON representations as defined in [`json_structure`]. The export
+//! corresponding JSON representations as defined in `json_structure`. The export
 //! architecture mirrors the connection dispatch pattern found in `proxy.rs`, where
 //! a top-level arbitrator delegates to protocol-specific implementation functions.
 //!
@@ -11,7 +11,7 @@
 //!
 //! 1. **Collection Export** ([`export_proxies_to_json`]): Writes multiple proxies to disk
 //! 2. **Single Proxy Dispatch** ([`proxy_to_json`]): Routes to protocol-specific converters
-//! 3. **Protocol Converters** ([`export_http`], [`export_socks5`], etc.): Build typed JSON structures
+//! 3. **Protocol Converters** (`export_http`, `export_socks5`, etc.): Build typed JSON structures
 //!
 //! This design ensures:
 //! - Type safety through `ProxyJson` enum variants
@@ -131,7 +131,7 @@ use crate::utils::json_structure::*;
 /// ```
 ///
 /// Each proxy is serialized according to its protocol-specific schema as defined
-/// in [`json_structure`], with the base configuration extracted and deduplicated.
+/// in `json_structure`, with the base configuration extracted and deduplicated.
 ///
 /// # Arguments
 ///
@@ -141,7 +141,7 @@ use crate::utils::json_structure::*;
 /// # Errors
 ///
 /// Returns [`ProxyError::SerializationError`] if JSON serialization fails.
-/// Returns [`ProxyError::IoError`] if file writing fails.
+/// Returns [`ProxyError::Io`] if file writing fails.
 ///
 /// # Examples
 ///
@@ -223,11 +223,11 @@ where
     // Write to filesystem asynchronously
     let mut file = fs::File::create(output_path)
         .await
-        .map_err(|e| ProxyError::IoError { source: e })?;
+        .map_err(|e| ProxyError::Io { source: e })?;
 
     file.write_all(json_string.as_bytes())
         .await
-        .map_err(|e| ProxyError::IoError { source: e })?;
+        .map_err(|e| ProxyError::Io { source: e })?;
 
     Ok(())
 }
@@ -347,7 +347,7 @@ fn export_http(host: &str, port: u16, config: &Arc<HTTPConfig>) -> ProxyJson {
 
 /// Exports an HTTPS proxy to its JSON representation.
 ///
-/// Identical to [`export_http`] but produces an [`HttpsProxyJson`] structure
+/// Identical to `export_http` but produces an [`HttpsProxyJson`] structure
 /// to distinguish HTTPS proxies in the serialized output.
 ///
 /// # Arguments

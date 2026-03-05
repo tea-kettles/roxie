@@ -33,6 +33,8 @@ use std::io;
 
 #[cfg(feature = "http")]
 use crate::errors::HTTPError;
+#[cfg(feature = "hysteria2")]
+use crate::errors::Hysteria2Error;
 #[cfg(feature = "socks4")]
 use crate::errors::SOCKS4Error;
 #[cfg(feature = "socks5")]
@@ -173,14 +175,6 @@ pub enum ProxyError {
         message: String,
     },
 
-    /// File I/O operation failed.
-    #[error("I/O error")]
-    IoError {
-        /// Underlying I/O error.
-        #[source]
-        source: io::Error,
-    },
-
     /* URL Errors */
     /// Target URL missing host.
     ///
@@ -253,6 +247,14 @@ pub enum ProxyError {
     #[cfg(feature = "tor")]
     #[error(transparent)]
     Tor(#[from] TorError),
+
+    /// Hysteria2 proxy error.
+    ///
+    /// Wraps all Hysteria2 QUIC proxy errors. Available when the `hysteria2`
+    /// feature is enabled.
+    #[cfg(feature = "hysteria2")]
+    #[error(transparent)]
+    Hysteria2(#[from] Hysteria2Error),
 
     /* I/O Errors */
     /// Generic I/O error during proxy operation.

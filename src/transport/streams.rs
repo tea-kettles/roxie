@@ -21,6 +21,9 @@ use crate::protocols::shadowsocks::{AeadCipher, CipherMethod, Nonce};
 #[cfg(feature = "shadowsocks")]
 use zeroize::Zeroize;
 
+#[cfg(feature = "hysteria2")]
+use quinn::{RecvStream, SendStream};
+
 /* Types */
 
 /// Shadowsocks encrypted stream wrapper.
@@ -61,6 +64,81 @@ impl fmt::Debug for ShadowsocksStream {
     }
 }
 
+/// QUIC stream wrapper for Hysteria2 connections.
+///
+/// Combines a [`quinn::SendStream`] and [`quinn::RecvStream`] from a single
+/// QUIC bidirectional stream opened after Hysteria2 authentication, plus a
+/// clone of the [`quinn::Connection`] to keep the QUIC connection alive for
+/// the lifetime of the stream.
+///
+/// After the Hysteria2 TCP framing handshake completes, the QUIC stream
+/// carries a raw byte pipe, so this type simply forwards reads and writes
+/// to the underlying stream halves.
+#[cfg(feature = "hysteria2")]
+pub struct Hysteria2TcpStream {
+    send: SendStream,
+    recv: RecvStream,
+    /// Keeps the QUIC connection alive as long as the stream is in use.
+    _conn: quinn::Connection,
+}
+
+#[cfg(feature = "hysteria2")]
+impl Hysteria2TcpStream {
+    /// Wraps a QUIC bidirectional stream pair into a `Hysteria2TcpStream`.
+    pub(crate) fn new(
+        send: SendStream,
+        recv: RecvStream,
+        conn: quinn::Connection,
+    ) -> Self {
+        Self {
+            send,
+            recv,
+            _conn: conn,
+        }
+    }
+}
+
+#[cfg(feature = "hysteria2")]
+impl fmt::Debug for Hysteria2TcpStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Hysteria2TcpStream").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "hysteria2")]
+impl AsyncRead for Hysteria2TcpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().recv).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "hysteria2")]
+impl AsyncWrite for Hysteria2TcpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        <quinn::SendStream as AsyncWrite>::poll_write(
+            Pin::new(&mut self.get_mut().send),
+            cx,
+            buf,
+        )
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().send).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().send).poll_shutdown(cx)
+    }
+}
+
 /// Unified stream type that wraps various transport types.
 ///
 /// Provides a single type that can represent TCP streams, TLS streams,
@@ -91,6 +169,18 @@ pub enum ProxyStream {
     /// Shadowsocks encrypted stream.
     #[cfg(feature = "shadowsocks")]
     Shadowsocks(Box<ShadowsocksStream>),
+
+    /// Hysteria2 QUIC stream presented as a TCP-like byte pipe.
+    #[cfg(feature = "hysteria2")]
+    Hysteria2(Box<Hysteria2TcpStream>),
+
+    /// TLS-wrapped Shadowsocks stream.
+    #[cfg(all(feature = "tls", feature = "shadowsocks"))]
+    TlsShadowsocks(Box<TlsStream<ShadowsocksStream>>),
+
+    /// TLS-wrapped Hysteria2 QUIC stream.
+    #[cfg(all(feature = "tls", feature = "hysteria2"))]
+    TlsHysteria2(Box<TlsStream<Hysteria2TcpStream>>),
 }
 
 /* Implementations */
@@ -178,22 +268,66 @@ impl ProxyStream {
         master_key: Vec<u8>,
         method: CipherMethod,
     ) -> Self {
-        Self::Shadowsocks(Box::new(ShadowsocksStream {
-            inner: stream,
-            send_cipher,
-            send_nonce,
-            recv_cipher: None,
-            recv_nonce: Nonce::new(),
-            master_key,
-            method,
-            salt_received: false,
-            write_buf: Vec::new(),
-            write_pos: 0,
-            write_pending: 0,
-            recv_raw: Vec::new(),
-            recv_plain: Vec::new(),
-            eof: false,
-        }))
+        Self::from_shadowsocks_stream(ShadowsocksStream::new(
+            stream, send_cipher, send_nonce, master_key, method,
+        ))
+    }
+
+    /// Wrap a bare [`ShadowsocksStream`] (no TLS).
+    #[cfg(feature = "shadowsocks")]
+    pub(crate) fn from_shadowsocks_stream(stream: ShadowsocksStream) -> Self {
+        Self::Shadowsocks(Box::new(stream))
+    }
+
+    /// Wrap a TLS-over-Shadowsocks stream.
+    #[cfg(all(feature = "tls", feature = "shadowsocks"))]
+    pub fn from_tls_shadowsocks(stream: TlsStream<ShadowsocksStream>) -> Self {
+        Self::TlsShadowsocks(Box::new(stream))
+    }
+
+    /// Wrap a Hysteria2 QUIC stream pair.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "hysteria2")]
+    /// # {
+    /// use roxie::transport::ProxyStream;
+    /// use roxie::protocols::hysteria2::establish_hysteria2;
+    /// use roxie::config::Hysteria2Config;
+    /// use url::Url;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = Hysteria2Config::new();
+    /// let target = Url::parse("https://example.com")?;
+    ///
+    /// let (send, recv, conn) =
+    ///     establish_hysteria2("proxy.example.com", 443, "secret", &config, &target).await?;
+    ///
+    /// let stream = ProxyStream::from_hysteria2(send, recv, conn);
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    #[cfg(feature = "hysteria2")]
+    pub fn from_hysteria2(
+        send: SendStream,
+        recv: RecvStream,
+        conn: quinn::Connection,
+    ) -> Self {
+        Self::from_hysteria2_stream(Hysteria2TcpStream::new(send, recv, conn))
+    }
+
+    /// Wrap a bare [`Hysteria2TcpStream`] (no TLS).
+    #[cfg(feature = "hysteria2")]
+    pub(crate) fn from_hysteria2_stream(stream: Hysteria2TcpStream) -> Self {
+        Self::Hysteria2(Box::new(stream))
+    }
+
+    /// Wrap a TLS-over-Hysteria2 stream.
+    #[cfg(all(feature = "tls", feature = "hysteria2"))]
+    pub fn from_tls_hysteria2(stream: TlsStream<Hysteria2TcpStream>) -> Self {
+        Self::TlsHysteria2(Box::new(stream))
     }
 
     /// Get a reference to the underlying TCP stream if this is TCP.
@@ -221,6 +355,12 @@ impl ProxyStream {
             Self::Tls(_) => None,
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(_) => None,
+            #[cfg(feature = "hysteria2")]
+            Self::Hysteria2(_) => None,
+            #[cfg(all(feature = "tls", feature = "shadowsocks"))]
+            Self::TlsShadowsocks(_) => None,
+            #[cfg(all(feature = "tls", feature = "hysteria2"))]
+            Self::TlsHysteria2(_) => None,
         }
     }
 
@@ -251,6 +391,12 @@ impl ProxyStream {
             Self::Tls(_) => None,
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(_) => None,
+            #[cfg(feature = "hysteria2")]
+            Self::Hysteria2(_) => None,
+            #[cfg(all(feature = "tls", feature = "shadowsocks"))]
+            Self::TlsShadowsocks(_) => None,
+            #[cfg(all(feature = "tls", feature = "hysteria2"))]
+            Self::TlsHysteria2(_) => None,
         }
     }
 
@@ -290,6 +436,12 @@ impl ProxyStream {
             Self::Tls(stream) => Some(stream),
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(_) => None,
+            #[cfg(feature = "hysteria2")]
+            Self::Hysteria2(_) => None,
+            #[cfg(feature = "shadowsocks")]
+            Self::TlsShadowsocks(_) => None,
+            #[cfg(feature = "hysteria2")]
+            Self::TlsHysteria2(_) => None,
         }
     }
 
@@ -329,6 +481,12 @@ impl ProxyStream {
             Self::Tls(stream) => Some(stream),
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(_) => None,
+            #[cfg(feature = "hysteria2")]
+            Self::Hysteria2(_) => None,
+            #[cfg(feature = "shadowsocks")]
+            Self::TlsShadowsocks(_) => None,
+            #[cfg(feature = "hysteria2")]
+            Self::TlsHysteria2(_) => None,
         }
     }
 }
@@ -347,6 +505,12 @@ impl AsyncRead for ProxyStream {
             Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(stream) => shadowsocks_poll_read(stream, cx, buf),
+            #[cfg(feature = "hysteria2")]
+            Self::Hysteria2(stream) => Pin::new(&mut stream.recv).poll_read(cx, buf),
+            #[cfg(all(feature = "tls", feature = "shadowsocks"))]
+            Self::TlsShadowsocks(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(all(feature = "tls", feature = "hysteria2"))]
+            Self::TlsHysteria2(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -365,6 +529,20 @@ impl AsyncWrite for ProxyStream {
             Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(stream) => shadowsocks_poll_write(stream, cx, buf),
+            #[cfg(feature = "hysteria2")]
+            Self::Hysteria2(stream) => {
+                // quinn::SendStream has an inherent poll_write returning WriteError
+                // that would shadow the trait method; use UFCS to force AsyncWrite dispatch.
+                <quinn::SendStream as AsyncWrite>::poll_write(
+                    Pin::new(&mut stream.send),
+                    cx,
+                    buf,
+                )
+            }
+            #[cfg(all(feature = "tls", feature = "shadowsocks"))]
+            Self::TlsShadowsocks(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(all(feature = "tls", feature = "hysteria2"))]
+            Self::TlsHysteria2(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
@@ -375,6 +553,12 @@ impl AsyncWrite for ProxyStream {
             Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(stream) => shadowsocks_poll_flush(stream, cx),
+            #[cfg(feature = "hysteria2")]
+            Self::Hysteria2(stream) => Pin::new(&mut stream.send).poll_flush(cx),
+            #[cfg(all(feature = "tls", feature = "shadowsocks"))]
+            Self::TlsShadowsocks(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(all(feature = "tls", feature = "hysteria2"))]
+            Self::TlsHysteria2(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
@@ -385,6 +569,12 @@ impl AsyncWrite for ProxyStream {
             Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(stream) => shadowsocks_poll_shutdown(stream, cx),
+            #[cfg(feature = "hysteria2")]
+            Self::Hysteria2(stream) => Pin::new(&mut stream.send).poll_shutdown(cx),
+            #[cfg(all(feature = "tls", feature = "shadowsocks"))]
+            Self::TlsShadowsocks(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(all(feature = "tls", feature = "hysteria2"))]
+            Self::TlsHysteria2(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -617,6 +807,64 @@ fn shadowsocks_poll_read(
 }
 
 #[cfg(feature = "shadowsocks")]
+impl ShadowsocksStream {
+    pub(crate) fn new(
+        stream: TcpStream,
+        send_cipher: AeadCipher,
+        send_nonce: Nonce,
+        master_key: Vec<u8>,
+        method: CipherMethod,
+    ) -> Self {
+        Self {
+            inner: stream,
+            send_cipher,
+            send_nonce,
+            recv_cipher: None,
+            recv_nonce: Nonce::new(),
+            master_key,
+            method,
+            salt_received: false,
+            write_buf: Vec::new(),
+            write_pos: 0,
+            write_pending: 0,
+            recv_raw: Vec::new(),
+            recv_plain: Vec::new(),
+            eof: false,
+        }
+    }
+}
+
+#[cfg(feature = "shadowsocks")]
+impl AsyncRead for ShadowsocksStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        shadowsocks_poll_read(self.get_mut(), cx, buf)
+    }
+}
+
+#[cfg(feature = "shadowsocks")]
+impl AsyncWrite for ShadowsocksStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        shadowsocks_poll_write(self.get_mut(), cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        shadowsocks_poll_flush(self.get_mut(), cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        shadowsocks_poll_shutdown(self.get_mut(), cx)
+    }
+}
+
+#[cfg(feature = "shadowsocks")]
 impl Drop for ShadowsocksStream {
     fn drop(&mut self) {
         self.master_key.zeroize();
@@ -688,6 +936,9 @@ mod tests {
     async fn proxystream_tls_handshake_timeout_enforced() {
         use std::time::Duration;
         use tokio::net::{TcpListener, TcpStream};
+        // quinn (hysteria2) pulls in aws-lc-rs alongside ring; install ring
+        // explicitly so rustls can pick a provider without ambiguity.
+        let _ = rustls::crypto::ring::default_provider().install_default();
 
         use crate::config::TLSConfig;
         use crate::errors::TLSError;

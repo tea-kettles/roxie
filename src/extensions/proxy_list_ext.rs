@@ -21,11 +21,33 @@ use crate::transport::{ProxyList, ProxyStream};
 /// Extension helpers for [`ProxyList`].
 ///
 /// Provides three connection strategies with semaphore-based rate limiting:
-/// - [`connect_random`]: Single random proxy attempt
-/// - [`connect_with_iteration`]: Sequential attempts until success
-/// - [`connect_with_semaphore`]: Concurrent attempts, first success wins
+/// - [`ProxyListExt::connect_random`]: Single random proxy attempt
+/// - [`ProxyListExt::connect_with_iteration`]: Sequential attempts until success
+/// - [`ProxyListExt::connect_with_semaphore`]: Concurrent attempts, first success wins
 #[allow(async_fn_in_trait)]
 pub trait ProxyListExt {
+    /// Returns a new list with all proxies of `protocol` removed.
+    ///
+    /// Protocol matching is ASCII case-insensitive.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use roxie::extensions::ProxyListExt;
+    /// use roxie::transport::ProxyList;
+    ///
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let list = ProxyList::from_lines(
+    ///     "http://proxy1.com:8080\nsocks5://proxy2.com:1080"
+    /// )?;
+    ///
+    /// let pruned = list.purge("http");
+    /// assert_eq!(pruned.len(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn purge(&self, protocol: &str) -> ProxyList;
+
     /// Attempts connection through a single random proxy.
     ///
     /// Acquires a semaphore permit, selects a random proxy, and attempts
@@ -145,6 +167,27 @@ pub trait ProxyListExt {
 /* Implementations */
 
 impl ProxyListExt for ProxyList {
+    fn purge(&self, protocol: &str) -> ProxyList {
+        let start = Instant::now();
+
+        let filtered = self
+            .iter()
+            .filter(|proxy| !proxy.get_scheme().eq_ignore_ascii_case(protocol))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        trace!(
+            protocol = protocol,
+            before = self.len(),
+            after = filtered.len(),
+            removed = self.len().saturating_sub(filtered.len()),
+            elapsed_ms = start.elapsed().as_millis(),
+            "purged proxies by protocol"
+        );
+
+        ProxyList::from_proxies(filtered)
+    }
+
     async fn connect_random(
         &self,
         target: &Url,
@@ -436,24 +479,145 @@ impl ProxyListExt for ProxyList {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
 
-    #[test]
-    fn empty_list_returns_none() {
-        // This would need async test framework, but showing structure
+    use tokio::sync::Semaphore;
+    use url::Url;
+
+    use super::ProxyListExt;
+    use crate::transport::ProxyList;
+
+    #[tokio::test]
+    async fn empty_list_connect_random_returns_none() {
+        let list = ProxyList::from_lines("").unwrap();
+        let sem = Arc::new(Semaphore::new(10));
+        let target = Url::parse("https://example.com").unwrap();
+        let result = list.connect_random(&target, &sem).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_list_connect_with_iteration_returns_none() {
+        let list = ProxyList::from_lines("").unwrap();
+        let sem = Arc::new(Semaphore::new(10));
+        let target = Url::parse("https://example.com").unwrap();
+        let result = list.connect_with_iteration(&target, &sem).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_list_connect_with_semaphore_returns_none() {
+        let list = ProxyList::from_lines("").unwrap();
+        let sem = Arc::new(Semaphore::new(10));
+        let target = Url::parse("https://example.com").unwrap();
+        let result = list.connect_with_semaphore(&target, &sem).await.unwrap();
+        assert!(result.is_none());
     }
 
     #[test]
-    fn iteration_tries_all_proxies_sequentially() {
-        // Test that iteration goes through proxies one by one
+    #[cfg(all(feature = "http", feature = "socks5"))]
+    fn purge_removes_matching_protocol() {
+        let list = ProxyList::from_lines(
+            "http://proxy1.example.com:8080\nsocks5://proxy2.example.com:1080",
+        )
+        .expect("failed to parse test proxy list");
+
+        let purged = list.purge("http");
+        assert_eq!(purged.len(), 1);
+        assert_eq!(purged.get(0).expect("missing proxy").get_scheme(), "socks5");
     }
 
     #[test]
-    fn semaphore_limits_concurrent_attempts() {
-        // Test that no more than N connections happen at once
+    #[cfg(feature = "http")]
+    fn purge_case_insensitive() {
+        let list = ProxyList::from_lines("http://proxy1.example.com:8080").unwrap();
+        let purged = list.purge("HTTP");
+        assert_eq!(purged.len(), 0);
     }
 
     #[test]
-    fn random_picks_from_available_proxies() {
-        // Test that random selection works
+    #[cfg(feature = "http")]
+    fn purge_no_match_leaves_list_intact() {
+        let list = ProxyList::from_lines("http://proxy1.example.com:8080").unwrap();
+        let purged = list.purge("socks5");
+        assert_eq!(purged.len(), 1);
+    }
+
+    #[test]
+    #[cfg(all(feature = "http", feature = "socks4", feature = "socks5"))]
+    fn purge_removes_only_matching_protocol_from_mixed_list() {
+        let list = ProxyList::from_lines(
+            "http://proxy1.com:8080\nsocks4://proxy2.com:1080\nsocks5://proxy3.com:1080\nhttp://proxy4.com:8080",
+        )
+        .unwrap();
+        assert_eq!(list.len(), 4);
+
+        let purged = list.purge("http");
+        assert_eq!(purged.len(), 2);
+        for proxy in purged.iter() {
+            assert_ne!(proxy.get_scheme(), "http");
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "http", feature = "socks5"))]
+    fn purge_all_of_one_protocol_leaves_others() {
+        let list = ProxyList::from_lines(
+            "http://proxy1.com:8080\nhttp://proxy2.com:8080\nsocks5://proxy3.com:1080",
+        )
+        .unwrap();
+
+        let purged = list.purge("http");
+        assert_eq!(purged.len(), 1);
+        assert_eq!(purged.get(0).unwrap().get_scheme(), "socks5");
+    }
+
+    #[test]
+    #[cfg(feature = "http")]
+    fn purge_all_proxies_of_only_protocol_gives_empty_list() {
+        let list = ProxyList::from_lines("http://proxy1.com:8080\nhttp://proxy2.com:8080").unwrap();
+        let purged = list.purge("http");
+        assert!(purged.is_empty());
+    }
+
+    #[test]
+    fn purge_from_empty_list_stays_empty() {
+        let list = ProxyList::from_lines("").unwrap();
+        let purged = list.purge("http");
+        assert!(purged.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "http")]
+    fn purge_is_idempotent() {
+        let list =
+            ProxyList::from_lines("http://proxy1.com:8080\nhttp://proxy2.com:8080").unwrap();
+        let purged_once = list.purge("socks5");
+        let purged_twice = purged_once.purge("socks5");
+        assert_eq!(purged_twice.len(), 2);
+    }
+
+    #[test]
+    #[cfg(feature = "socks4")]
+    fn purge_socks4a_does_not_remove_socks4() {
+        let list = ProxyList::from_lines(
+            "socks4://proxy1.com:1080\nsocks4a://proxy2.com:1080",
+        )
+        .unwrap();
+        let purged = list.purge("socks4a");
+        assert_eq!(purged.len(), 1);
+        assert_eq!(purged.get(0).unwrap().get_scheme(), "socks4");
+    }
+
+    #[test]
+    #[cfg(feature = "socks5")]
+    fn purge_socks5h_does_not_remove_socks5() {
+        let list = ProxyList::from_lines(
+            "socks5://proxy1.com:1080\nsocks5h://proxy2.com:1080",
+        )
+        .unwrap();
+        let purged = list.purge("socks5h");
+        assert_eq!(purged.len(), 1);
+        assert_eq!(purged.get(0).unwrap().get_scheme(), "socks5");
     }
 }
