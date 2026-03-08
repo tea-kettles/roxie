@@ -8,7 +8,7 @@ Cargo.lock
 /proxies
 
 # Export-import test artifacts written to disk during test runs
-/tests/
+/tests/ignored
 /.claude
 
 # Style Guide
