@@ -24,6 +24,13 @@ use zeroize::Zeroize;
 #[cfg(feature = "hysteria2")]
 use quinn::{RecvStream, SendStream};
 
+#[cfg(feature = "trojan")]
+use futures::{Sink, Stream};
+#[cfg(feature = "trojan")]
+use tokio_tungstenite::WebSocketStream;
+#[cfg(feature = "trojan")]
+use tokio_tungstenite::tungstenite::Message;
+
 /* Types */
 
 /// Shadowsocks encrypted stream wrapper.
@@ -139,6 +146,131 @@ impl AsyncWrite for Hysteria2TcpStream {
     }
 }
 
+/// WebSocket byte-stream wrapper for Trojan-WS connections.
+///
+/// Bridges the message-based `WebSocketStream` API to the byte-stream
+/// `AsyncRead + AsyncWrite` interface expected by the rest of the library.
+/// Incoming binary frames are buffered so callers receive a continuous
+/// byte stream; outgoing bytes are each wrapped in a single binary frame.
+#[cfg(feature = "trojan")]
+pub struct WsStream<S: AsyncRead + AsyncWrite + Unpin> {
+    inner: WebSocketStream<S>,
+    // Leftover bytes from a WebSocket frame that did not fit into the last read buffer.
+    read_buf: Vec<u8>,
+    read_pos: usize,
+}
+
+#[cfg(feature = "trojan")]
+impl<S: AsyncRead + AsyncWrite + Unpin> WsStream<S> {
+    pub(crate) fn new(ws: WebSocketStream<S>) -> Self {
+        Self { inner: ws, read_buf: Vec::new(), read_pos: 0 }
+    }
+}
+
+#[cfg(feature = "trojan")]
+impl<S: AsyncRead + AsyncWrite + Unpin> fmt::Debug for WsStream<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WsStream")
+            .field("buffered_bytes", &(self.read_buf.len() - self.read_pos))
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "trojan")]
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+
+        // Drain leftover bytes from a previous frame first.
+        if this.read_pos < this.read_buf.len() {
+            let available = &this.read_buf[this.read_pos..];
+            let n = available.len().min(buf.remaining());
+            buf.put_slice(&available[..n]);
+            this.read_pos += n;
+            if this.read_pos >= this.read_buf.len() {
+                this.read_buf.clear();
+                this.read_pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        // Fetch the next WebSocket message.
+        loop {
+            match <WebSocketStream<S> as Stream>::poll_next(Pin::new(&mut this.inner), cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(io::Error::other(e.to_string())));
+                }
+                Poll::Ready(Some(Ok(msg))) => {
+                    // tokio-tungstenite auto-replies to Ping; skip control frames.
+                    if matches!(msg, Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) {
+                        continue;
+                    }
+                    if matches!(msg, Message::Close(_)) {
+                        return Poll::Ready(Ok(()));
+                    }
+                    let data = msg.into_data();
+                    if data.is_empty() {
+                        continue;
+                    }
+                    let n = data.len().min(buf.remaining());
+                    buf.put_slice(&data[..n]);
+                    if n < data.len() {
+                        this.read_buf = data[n..].to_vec();
+                        this.read_pos = 0;
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "trojan")]
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match <WebSocketStream<S> as Sink<Message>>::poll_ready(
+            Pin::new(&mut this.inner),
+            cx,
+        ) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
+            Poll::Ready(Ok(())) => {}
+        }
+        let msg = Message::binary(buf.to_vec());
+        match <WebSocketStream<S> as Sink<Message>>::start_send(Pin::new(&mut this.inner), msg) {
+            Ok(()) => Poll::Ready(Ok(buf.len())),
+            Err(e) => Poll::Ready(Err(io::Error::other(e.to_string()))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        <WebSocketStream<S> as Sink<Message>>::poll_flush(
+            Pin::new(&mut self.get_mut().inner),
+            cx,
+        )
+        .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        <WebSocketStream<S> as Sink<Message>>::poll_close(
+            Pin::new(&mut self.get_mut().inner),
+            cx,
+        )
+        .map_err(|e| io::Error::other(e.to_string()))
+    }
+}
+
 /// Unified stream type that wraps various transport types.
 ///
 /// Provides a single type that can represent TCP streams, TLS streams,
@@ -181,6 +313,21 @@ pub enum ProxyStream {
     /// TLS-wrapped Hysteria2 QUIC stream.
     #[cfg(all(feature = "tls", feature = "hysteria2"))]
     TlsHysteria2(Box<TlsStream<Hysteria2TcpStream>>),
+
+    /// TLS-over-TLS stream for Trojan proxies with HTTPS targets.
+    ///
+    /// The inner `TlsStream<TcpStream>` is the TLS channel to the Trojan proxy server.
+    /// The outer `TlsStream` is the second TLS handshake to the HTTPS target inside
+    /// the Trojan tunnel.
+    #[cfg(all(feature = "tls", feature = "trojan"))]
+    TlsTrojan(Box<TlsStream<TlsStream<TcpStream>>>),
+
+    /// Trojan-over-WebSocket stream.
+    ///
+    /// The Trojan header and payload are transported inside WebSocket binary frames
+    /// through the TLS tunnel, enabling CDN-fronting and firewall bypass.
+    #[cfg(all(feature = "tls", feature = "trojan"))]
+    TrojanWs(Box<WsStream<TlsStream<TcpStream>>>),
 }
 
 /* Implementations */
@@ -330,6 +477,21 @@ impl ProxyStream {
         Self::TlsHysteria2(Box::new(stream))
     }
 
+    /// Wrap a TLS-over-TLS (Trojan) stream.
+    ///
+    /// Used when a Trojan proxy connection is made to an HTTPS target, requiring
+    /// a second TLS handshake inside the Trojan tunnel.
+    #[cfg(all(feature = "tls", feature = "trojan"))]
+    pub fn from_tls_trojan(stream: TlsStream<TlsStream<TcpStream>>) -> Self {
+        Self::TlsTrojan(Box::new(stream))
+    }
+
+    /// Wrap a Trojan-over-WebSocket stream.
+    #[cfg(all(feature = "tls", feature = "trojan"))]
+    pub(crate) fn from_trojan_ws(stream: WsStream<TlsStream<TcpStream>>) -> Self {
+        Self::TrojanWs(Box::new(stream))
+    }
+
     /// Get a reference to the underlying TCP stream if this is TCP.
     ///
     /// Returns `None` if the stream is TLS-wrapped or Shadowsocks-encrypted.
@@ -361,6 +523,10 @@ impl ProxyStream {
             Self::TlsShadowsocks(_) => None,
             #[cfg(all(feature = "tls", feature = "hysteria2"))]
             Self::TlsHysteria2(_) => None,
+            #[cfg(all(feature = "tls", feature = "trojan"))]
+            Self::TlsTrojan(_) => None,
+            #[cfg(all(feature = "tls", feature = "trojan"))]
+            Self::TrojanWs(_) => None,
         }
     }
 
@@ -397,6 +563,10 @@ impl ProxyStream {
             Self::TlsShadowsocks(_) => None,
             #[cfg(all(feature = "tls", feature = "hysteria2"))]
             Self::TlsHysteria2(_) => None,
+            #[cfg(all(feature = "tls", feature = "trojan"))]
+            Self::TlsTrojan(_) => None,
+            #[cfg(all(feature = "tls", feature = "trojan"))]
+            Self::TrojanWs(_) => None,
         }
     }
 
@@ -442,6 +612,10 @@ impl ProxyStream {
             Self::TlsShadowsocks(_) => None,
             #[cfg(feature = "hysteria2")]
             Self::TlsHysteria2(_) => None,
+            #[cfg(feature = "trojan")]
+            Self::TlsTrojan(_) => None,
+            #[cfg(feature = "trojan")]
+            Self::TrojanWs(_) => None,
         }
     }
 
@@ -487,6 +661,10 @@ impl ProxyStream {
             Self::TlsShadowsocks(_) => None,
             #[cfg(feature = "hysteria2")]
             Self::TlsHysteria2(_) => None,
+            #[cfg(feature = "trojan")]
+            Self::TlsTrojan(_) => None,
+            #[cfg(feature = "trojan")]
+            Self::TrojanWs(_) => None,
         }
     }
 }
@@ -511,6 +689,10 @@ impl AsyncRead for ProxyStream {
             Self::TlsShadowsocks(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(all(feature = "tls", feature = "hysteria2"))]
             Self::TlsHysteria2(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(all(feature = "tls", feature = "trojan"))]
+            Self::TlsTrojan(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(all(feature = "tls", feature = "trojan"))]
+            Self::TrojanWs(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -543,6 +725,10 @@ impl AsyncWrite for ProxyStream {
             Self::TlsShadowsocks(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(all(feature = "tls", feature = "hysteria2"))]
             Self::TlsHysteria2(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(all(feature = "tls", feature = "trojan"))]
+            Self::TlsTrojan(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(all(feature = "tls", feature = "trojan"))]
+            Self::TrojanWs(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
@@ -559,6 +745,10 @@ impl AsyncWrite for ProxyStream {
             Self::TlsShadowsocks(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(all(feature = "tls", feature = "hysteria2"))]
             Self::TlsHysteria2(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(all(feature = "tls", feature = "trojan"))]
+            Self::TlsTrojan(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(all(feature = "tls", feature = "trojan"))]
+            Self::TrojanWs(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
@@ -575,6 +765,10 @@ impl AsyncWrite for ProxyStream {
             Self::TlsShadowsocks(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(all(feature = "tls", feature = "hysteria2"))]
             Self::TlsHysteria2(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(all(feature = "tls", feature = "trojan"))]
+            Self::TlsTrojan(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(all(feature = "tls", feature = "trojan"))]
+            Self::TrojanWs(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -759,50 +953,56 @@ fn shadowsocks_poll_read(
         return Poll::Ready(Ok(()));
     }
 
-    // Need more data from network
-    let mut tmp = [0u8; 8192];
-    let mut tmp_buf = ReadBuf::new(&mut tmp);
-
-    match Pin::new(&mut stream.inner).poll_read(cx, &mut tmp_buf) {
-        Poll::Ready(Ok(())) => {
-            if tmp_buf.filled().is_empty() {
-                stream.eof = true;
-                return Poll::Ready(Ok(()));
-            }
-            stream.recv_raw.extend_from_slice(tmp_buf.filled());
-        }
-        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-        Poll::Pending => return Poll::Pending,
-    }
-
-    // Try to decrypt newly received data
+    // Read from the socket in a loop until we can produce plaintext or the
+    // socket signals it is not ready. Each iteration either decodes a chunk
+    // (and returns it), hits EOF, or blocks on the socket (Poll::Pending) —
+    // so the loop always makes forward progress and never spins.
     loop {
-        match crate::protocols::shadowsocks::decode_chunk(
-            cipher,
-            &mut stream.recv_nonce,
-            &mut stream.recv_raw,
-        ) {
-            Ok(Some(plain)) => stream.recv_plain.extend_from_slice(&plain),
-            Ok(None) => break,
-            Err(e) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    e.to_string(),
-                )));
+        let mut tmp = [0u8; 8192];
+        let mut tmp_buf = ReadBuf::new(&mut tmp);
+
+        match Pin::new(&mut stream.inner).poll_read(cx, &mut tmp_buf) {
+            Poll::Ready(Ok(())) => {
+                if tmp_buf.filled().is_empty() {
+                    stream.eof = true;
+                    return Poll::Ready(Ok(()));
+                }
+                stream.recv_raw.extend_from_slice(tmp_buf.filled());
+            }
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            // Socket has no more buffered data right now. The waker registered
+            // by poll_read will fire when new bytes arrive, parking this task
+            // until then instead of spinning.
+            Poll::Pending => return Poll::Pending,
+        }
+
+        // Try to decrypt with the newly buffered bytes.
+        loop {
+            match crate::protocols::shadowsocks::decode_chunk(
+                cipher,
+                &mut stream.recv_nonce,
+                &mut stream.recv_raw,
+            ) {
+                Ok(Some(plain)) => stream.recv_plain.extend_from_slice(&plain),
+                Ok(None) => break,
+                Err(e) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    )));
+                }
             }
         }
-    }
 
-    // Return decrypted data if available, otherwise signal we need more
-    if !stream.recv_plain.is_empty() {
-        let n = buf.remaining().min(stream.recv_plain.len());
-        buf.put_slice(&stream.recv_plain.drain(..n).collect::<Vec<_>>());
-        Poll::Ready(Ok(()))
-    } else {
-        // We read data but couldn't form a complete chunk yet
-        // Wake ourselves to try again
-        cx.waker().wake_by_ref();
-        Poll::Pending
+        if !stream.recv_plain.is_empty() {
+            let n = buf.remaining().min(stream.recv_plain.len());
+            buf.put_slice(&stream.recv_plain.drain(..n).collect::<Vec<_>>());
+            return Poll::Ready(Ok(()));
+        }
+
+        // Still not enough bytes to form a complete chunk. Loop back and read
+        // more from the socket. If the socket is drained, poll_read returns
+        // Pending above, correctly parking the task.
     }
 }
 

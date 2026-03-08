@@ -1,0 +1,6 @@
+Drop Linux/Pi binaries here:
+  ssserver
+  hysteria-linux-arm64
+  3proxy
+  xray
+  tor                ← from Tor Expert Bundle (torproject.org) or: apt install tor

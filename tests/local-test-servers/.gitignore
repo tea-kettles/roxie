@@ -1,0 +1,16 @@
+# ── Binaries (user-supplied — drop in after cloning) ──────────────────────────
+bins/windows/*.exe
+bins/windows/*.dll
+bins/linux/ssserver
+bins/linux/hysteria-linux-arm64
+bins/linux/3proxy
+bins/linux/xray
+bins/linux/tor
+bins/linux/tor-gencert
+bins/*/pluggable_transports/
+
+# ── TLS certificates (generated at runtime by tailscale cert) ─────────────────
+certs/
+
+# ── Generated config files (written at runtime by start scripts) ──────────────
+config/

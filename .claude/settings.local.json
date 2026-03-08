@@ -35,7 +35,20 @@
       "Bash(grep \"#\\\\[test\\\\]\" /c/Users/tea/Downloads/roxie-development/src/**/*.rs)",
       "Bash(grep -c \"^pub fn\\\\|^pub struct\\\\|^pub enum\\\\|^pub trait\\\\|^pub type\\\\|^    pub fn\" /c/Users/tea/Downloads/roxie-development/src/**/*.rs)",
       "Bash(cargo test --manifest-path /c/Users/tea/Downloads/roxie-development/Cargo.toml)",
-      "Bash(cargo test --lib)"
+      "Bash(cargo test --lib)",
+      "Bash(cargo test --test live_trojan_probe)",
+      "Bash(gh pr list)",
+      "Bash(unzip -l \"shadowsocks-v1.24.0.x86_64-pc-windows-msvc.zip\")",
+      "Bash(unzip -l \"3proxy-0.9.5-arm64.zip\")",
+      "Bash(tar -tJf \"shadowsocks-v1.24.0.aarch64-unknown-linux-musl.tar.xz\")",
+      "Bash(unzip -j \"shadowsocks-v1.24.0.x86_64-pc-windows-msvc.zip\" \"ssserver.exe\")",
+      "Bash(unzip -j \"3proxy-0.9.5-x64.zip\" \"bin64/3proxy.exe\")",
+      "Bash(unzip -j \"Xray-windows-64.zip\" \"xray.exe\")",
+      "Bash(ls *.exe)",
+      "Bash(tar -xJf \"shadowsocks-v1.24.0.aarch64-unknown-linux-musl.tar.xz\" \"ssserver\")",
+      "Bash(unzip -j \"3proxy-0.9.5-arm64.zip\" \"bin64/3proxy.exe\" -d .)",
+      "Bash(mv \"3proxy.exe\" \"3proxy\")",
+      "Bash(unzip -j \"Xray-linux-arm64-v8a.zip\" \"xray\")"
     ]
   }
 }

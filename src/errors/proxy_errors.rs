@@ -45,6 +45,8 @@ use crate::errors::ShadowsocksError;
 use crate::errors::TLSError;
 #[cfg(feature = "tor")]
 use crate::errors::TorError;
+#[cfg(feature = "trojan")]
+use crate::errors::TrojanError;
 
 /* Types */
 
@@ -255,6 +257,14 @@ pub enum ProxyError {
     #[cfg(feature = "hysteria2")]
     #[error(transparent)]
     Hysteria2(#[from] Hysteria2Error),
+
+    /// Trojan proxy error.
+    ///
+    /// Wraps all Trojan TLS proxy errors. Available when the `trojan`
+    /// feature is enabled.
+    #[cfg(feature = "trojan")]
+    #[error(transparent)]
+    Trojan(#[from] TrojanError),
 
     /* I/O Errors */
     /// Generic I/O error during proxy operation.

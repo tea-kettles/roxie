@@ -53,6 +53,8 @@ pub struct TrojanConfig {
     ws_enabled: bool,
     // WebSocket path.
     ws_path: String,
+    // WebSocket Host header override (for CDN fronting; defaults to SNI or proxy host).
+    ws_host: Option<String>,
     // WebSocket headers (for example "key1:value1;key2:value2").
     ws_headers: Option<String>,
     // Connection timeout when establishing the Trojan tunnel.
@@ -90,6 +92,7 @@ impl TrojanConfig {
             alpn: "h2,http/1.1".to_string(),
             ws_enabled: false,
             ws_path: "/".to_string(),
+            ws_host: None,
             ws_headers: None,
             connection_timeout: Duration::from_secs(10),
         }
@@ -201,6 +204,20 @@ impl TrojanConfig {
         self
     }
 
+    /// Sets the WebSocket Host header used in the HTTP upgrade request.
+    ///
+    /// Useful for CDN fronting where the Host header differs from the proxy IP.
+    pub fn set_ws_host(mut self, host: impl Into<String>) -> Self {
+        self.ws_host = Some(host.into());
+        self
+    }
+
+    /// Clears the WebSocket Host header override.
+    pub fn clear_ws_host(mut self) -> Self {
+        self.ws_host = None;
+        self
+    }
+
     /// Sets the WebSocket headers.
     ///
     /// Headers are formatted as `"key1:value1;key2:value2"`.
@@ -279,6 +296,11 @@ impl TrojanConfig {
     /// Returns the configured WebSocket path.
     pub fn get_ws_path(&self) -> &str {
         &self.ws_path
+    }
+
+    /// Returns the configured WebSocket Host header override, if any.
+    pub fn get_ws_host(&self) -> Option<&str> {
+        self.ws_host.as_deref()
     }
 
     /// Returns the configured WebSocket headers, if any.

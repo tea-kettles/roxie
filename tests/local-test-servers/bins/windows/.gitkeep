@@ -1,0 +1,6 @@
+Drop Windows binaries here:
+  ssserver.exe
+  hysteria-windows-amd64.exe
+  3proxy.exe
+  xray.exe
+  tor.exe            ← from Tor Expert Bundle (torproject.org)

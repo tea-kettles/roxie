@@ -138,6 +138,18 @@ pub enum Proxy {
         password: String,
         config: Arc<Hysteria2Config>,
     },
+
+    /// Trojan TLS-based proxy.
+    ///
+    /// Traffic is disguised as HTTPS by establishing TLS directly to the proxy server
+    /// and prefixing each TCP stream with a SHA-224 password hash header.
+    #[cfg(feature = "trojan")]
+    Trojan {
+        host: String,
+        port: u16,
+        password: String,
+        config: Arc<TrojanConfig>,
+    },
 }
 
 /* Implementations */
@@ -252,6 +264,17 @@ impl Proxy {
                 config,
             } => {
                 self.connect_hysteria2(host, *port, password, config, destination)
+                    .await
+            }
+
+            #[cfg(feature = "trojan")]
+            Proxy::Trojan {
+                host,
+                port,
+                password,
+                config,
+            } => {
+                self.connect_trojan(host, *port, password, config, destination)
                     .await
             }
 
@@ -517,6 +540,196 @@ impl Proxy {
         Ok(ProxyStream::from_hysteria2_stream(hy2_stream))
     }
 
+    #[cfg(feature = "trojan")]
+    async fn connect_trojan(
+        &self,
+        host: &str,
+        port: u16,
+        password: &str,
+        config: &TrojanConfig,
+        destination: &Url,
+    ) -> Result<ProxyStream, ProxyError> {
+        use crate::config::TLSConfig;
+        use crate::errors::TrojanError;
+        use crate::transport::tls::establish_tls;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::http::header::{HOST, HeaderName, HeaderValue};
+
+        let timeout_dur = config.get_connection_timeout();
+        let result = tokio::time::timeout(timeout_dur, async {
+            let proxy_addr = format!("{}:{}", host, port);
+            let tcp = TcpStream::connect(&proxy_addr)
+                .await
+                .map_err(|e| ProxyError::ConnectionFailed {
+                    host: host.to_string(),
+                    port,
+                    source: e,
+                })?;
+
+            trace!(proxy_addr = proxy_addr, "TCP connected, starting Trojan TLS handshake");
+
+            // Build TLS config from TrojanConfig fields.
+            let sni = config.get_sni().unwrap_or(host);
+            let mut tls_config = TLSConfig::new()
+                .set_handshake_timeout(config.get_base_config().get_handshake_timeout())
+                .set_danger_accept_invalid_certs(config.is_skip_cert_verify());
+
+            // WebSocket requires HTTP/1.1; force that ALPN so CDN/Cloudflare servers don't
+            // negotiate h2, which would break the HTTP Upgrade handshake.
+            if config.is_ws_enabled() {
+                tls_config = tls_config.set_alpn(vec![b"http/1.1".to_vec()]);
+            } else {
+                // Parse comma-separated ALPN strings into wire-format byte vecs.
+                let alpn_protos: Vec<Vec<u8>> = config
+                    .get_alpn()
+                    .split(',')
+                    .map(|s| s.trim().as_bytes().to_vec())
+                    .filter(|b| !b.is_empty())
+                    .collect();
+                if !alpn_protos.is_empty() {
+                    tls_config = tls_config.set_alpn(alpn_protos);
+                }
+            }
+
+            let mut tls_stream = establish_tls(tcp, sni, &tls_config)
+                .await
+                .map_err(|e| TrojanError::TlsHandshakeFailed {
+                    host: host.to_string(),
+                    source: std::io::Error::other(e.to_string()),
+                })?;
+
+            trace!(proxy_addr = proxy_addr, "TLS handshake complete");
+
+            // WebSocket transport path.
+            if config.is_ws_enabled() {
+                use crate::transport::streams::WsStream;
+
+                let ws_host = config.get_ws_host().unwrap_or(sni);
+                let ws_path = config.get_ws_path();
+                let ws_url = format!("ws://{}{}", ws_host, ws_path);
+
+                trace!(
+                    proxy_addr = proxy_addr,
+                    ws_url = ws_url,
+                    "upgrading to WebSocket"
+                );
+
+                let mut request = ws_url
+                    .clone()
+                    .into_client_request()
+                    .map_err(|e| ProxyError::InvalidConfiguration {
+                        reason: format!("invalid trojan ws url '{}': {}", ws_url, e),
+                    })?;
+
+                // Ensure Host header tracks ws_host overrides.
+                let host_header = HeaderValue::from_str(ws_host).map_err(|e| {
+                    ProxyError::InvalidConfiguration {
+                        reason: format!("invalid trojan ws host header '{}': {}", ws_host, e),
+                    }
+                })?;
+                request.headers_mut().insert(HOST, host_header);
+
+                if let Some(raw_headers) = config.get_ws_headers() {
+                    for pair in raw_headers
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        let (name, value) =
+                            pair.split_once(':')
+                                .ok_or_else(|| ProxyError::InvalidConfiguration {
+                                    reason: format!(
+                                        "invalid trojan ws header '{}', expected 'Name: Value'",
+                                        pair
+                                    ),
+                                })?;
+
+                        let name = HeaderName::from_bytes(name.trim().as_bytes()).map_err(|e| {
+                            ProxyError::InvalidConfiguration {
+                                reason: format!("invalid trojan ws header name '{}': {}", name, e),
+                            }
+                        })?;
+
+                        let value = HeaderValue::from_str(value.trim()).map_err(|e| {
+                            ProxyError::InvalidConfiguration {
+                                reason: format!(
+                                    "invalid trojan ws header value for '{}': {}",
+                                    name, e
+                                ),
+                            }
+                        })?;
+
+                        request.headers_mut().insert(name, value);
+                    }
+                }
+
+                let (ws, _) =
+                    tokio_tungstenite::client_async(request, tls_stream)
+                        .await
+                        .map_err(|e| TrojanError::Io {
+                            source: std::io::Error::other(e.to_string()),
+                        })?;
+
+                let mut ws_stream = WsStream::new(ws);
+
+                trace!(
+                    proxy_addr = proxy_addr,
+                    "WebSocket upgrade complete, sending Trojan header"
+                );
+
+                protocols::trojan::establish_trojan(&mut ws_stream, destination, password).await?;
+
+                trace!(proxy_addr = proxy_addr, "Trojan header sent via WebSocket");
+
+                return Ok(ProxyStream::from_trojan_ws(ws_stream));
+            }
+
+            // Plain TLS path.
+            trace!(proxy_addr = proxy_addr, "sending Trojan header");
+
+            protocols::trojan::establish_trojan(&mut tls_stream, destination, password).await?;
+
+            trace!(proxy_addr = proxy_addr, "Trojan header sent");
+
+            // If auto_tls is enabled and target is HTTPS, wrap in a second TLS layer.
+            if config.get_base_config().is_auto_tls() && destination.scheme() == "https" {
+                let target_host = destination.host_str().ok_or(ProxyError::MissingTargetHost)?;
+                let inner_tls_config = config
+                    .get_base_config()
+                    .get_tls_config()
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        TLSConfig::new()
+                            .set_handshake_timeout(config.get_base_config().get_handshake_timeout())
+                    });
+
+                trace!(
+                    proxy_addr = proxy_addr,
+                    target_host = target_host,
+                    "auto_tls: wrapping Trojan tunnel in second TLS for HTTPS target"
+                );
+
+                let target_tls = establish_tls(tls_stream, target_host, &inner_tls_config).await?;
+
+                trace!(target_host = target_host, "second TLS handshake complete");
+
+                return Ok(ProxyStream::from_tls_trojan(target_tls));
+            }
+
+            Ok(ProxyStream::Tls(Box::new(tls_stream)))
+        })
+        .await;
+
+        match result {
+            Ok(v) => v,
+            Err(_) => Err(ProxyError::ConnectionTimeout {
+                host: host.to_string(),
+                port,
+                timeout_ms: timeout_dur.as_millis() as u64,
+            }),
+        }
+    }
+
     /// Wraps a connected TCP stream in TLS when auto_tls is enabled and the destination is HTTPS.
     ///
     /// Returns [`ProxyStream::Tls`] when TLS is applied, or [`ProxyStream::Tcp`] otherwise.
@@ -589,6 +802,8 @@ impl Proxy {
             Proxy::Shadowsocks { host, .. } => host,
             #[cfg(feature = "hysteria2")]
             Proxy::Hysteria2 { host, .. } => host,
+            #[cfg(feature = "trojan")]
+            Proxy::Trojan { host, .. } => host,
         }
     }
 
@@ -623,6 +838,8 @@ impl Proxy {
             Proxy::Shadowsocks { port, .. } => *port,
             #[cfg(feature = "hysteria2")]
             Proxy::Hysteria2 { port, .. } => *port,
+            #[cfg(feature = "trojan")]
+            Proxy::Trojan { port, .. } => *port,
         }
     }
 
@@ -663,6 +880,8 @@ impl Proxy {
             Proxy::Shadowsocks { .. } => "shadowsocks",
             #[cfg(feature = "hysteria2")]
             Proxy::Hysteria2 { .. } => "hysteria2",
+            #[cfg(feature = "trojan")]
+            Proxy::Trojan { .. } => "trojan",
         }
     }
 
@@ -841,6 +1060,23 @@ impl Proxy {
                 let mut new_config = (*config).clone();
                 new_config.set_base_arc(base.clone());
                 Proxy::Hysteria2 {
+                    host,
+                    port,
+                    password,
+                    config: Arc::new(new_config),
+                }
+            }
+
+            #[cfg(feature = "trojan")]
+            Proxy::Trojan {
+                host,
+                port,
+                password,
+                config,
+            } => {
+                let mut new_config = (*config).clone();
+                new_config.set_base_arc(base.clone());
+                Proxy::Trojan {
                     host,
                     port,
                     password,

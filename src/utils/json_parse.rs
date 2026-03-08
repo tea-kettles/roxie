@@ -172,6 +172,50 @@ pub fn parse_proxy_url(url_str: &str) -> Result<Option<Proxy>, ParseError> {
             }))
         }
 
+        #[cfg(feature = "trojan")]
+        "trojan" | "trojan-gfw" => {
+            // trojan://password@host:port?sni=example.com&allowInsecure=1
+            let password = match (username.as_deref(), password.as_deref()) {
+                (Some(u), None) if !u.is_empty() => u.to_string(),
+                // Some clients put the password in the standard password field
+                (None, Some(p)) if !p.is_empty() => p.to_string(),
+                (Some(u), Some(_)) if !u.is_empty() => u.to_string(),
+                _ => {
+                    return Err(ParseError::MissingField {
+                        field: "password (trojan expects password@host:port)".to_string(),
+                    });
+                }
+            };
+
+            let mut config = TrojanConfig::new();
+
+            for (key, value) in url.query_pairs() {
+                match key.as_ref() {
+                    "sni" | "peer" => config = config.set_sni(value.as_ref()),
+                    "allowInsecure" | "insecure" => {
+                        config =
+                            config.set_skip_cert_verify(value == "1" || value == "true")
+                    }
+                    "alpn" => config = config.set_alpn(value.as_ref()),
+                    "type" => {
+                        if value == "ws" || value == "websocket" {
+                            config = config.set_ws_enabled(true);
+                        }
+                    }
+                    "path" => config = config.set_ws_path(value.as_ref()),
+                    "host" => config = config.set_ws_host(value.as_ref()),
+                    _ => {}
+                }
+            }
+
+            Ok(Some(Proxy::Trojan {
+                host,
+                port,
+                password,
+                config: Arc::new(config),
+            }))
+        }
+
         #[cfg(feature = "shadowsocks")]
         "shadowsocks" | "ss" => {
             let (host, port, password, config) = parse_shadowsocks_url_credentials(
@@ -272,6 +316,8 @@ fn default_port_for_scheme(scheme: &str) -> u16 {
         "shadowsocks" | "ss" => DEFAULT_SHADOWSOCKS_PORT,
         #[cfg(feature = "hysteria2")]
         "hysteria2" | "hy2" => DEFAULT_HYSTERIA2_PORT,
+        #[cfg(feature = "trojan")]
+        "trojan" | "trojan-gfw" => 443,
         _ => 8080, // Fallback
     }
 }
@@ -638,6 +684,57 @@ pub fn parse_proxy_json(value: &Value) -> Result<Option<Proxy>, ParseError> {
             }))
         }
 
+        #[cfg(feature = "trojan")]
+        "trojan" | "trojan-gfw" => {
+            let password = password.clone().ok_or_else(|| ParseError::MissingField {
+                field: "password".to_string(),
+            })?;
+
+            // Support both nested `config` and legacy top-level Trojan fields.
+            let mut config = if let Some(cfg) = config_value {
+                parse_trojan_config(cfg)?
+            } else {
+                TrojanConfig::new()
+            };
+
+            // Backward-compatible top-level overrides.
+            if let Some(sni) = obj.get("sni").and_then(|v| v.as_str()) {
+                config = config.set_sni(sni);
+            }
+            if let Some(skip) = obj.get("skip_cert_verify").and_then(|v| v.as_bool()) {
+                config = config.set_skip_cert_verify(skip);
+            }
+            if let Some(alpn) = obj.get("alpn").and_then(|v| v.as_str()) {
+                config = config.set_alpn(alpn);
+            }
+            if let Some(enabled) = obj.get("ws_enabled").and_then(|v| v.as_bool()) {
+                config = config.set_ws_enabled(enabled);
+            }
+            if let Some(path) = obj.get("ws_path").and_then(|v| v.as_str()) {
+                config = config.set_ws_path(path);
+            }
+            if let Some(host) = obj.get("ws_host").and_then(|v| v.as_str()) {
+                config = config.set_ws_host(host);
+            }
+            if let Some(headers) = obj.get("ws_headers").and_then(|v| v.as_str()) {
+                config = config.set_ws_headers(headers);
+            }
+            if let Some(timeout) = obj.get("connection_timeout").and_then(|v| v.as_u64()) {
+                config = config.set_connection_timeout(Duration::from_secs(timeout));
+            }
+
+            if let Some(base) = base_value {
+                apply_base_config(&mut config, base)?;
+            }
+
+            Ok(Some(Proxy::Trojan {
+                host,
+                port,
+                password,
+                config: Arc::new(config),
+            }))
+        }
+
         _ => {
             warn!(protocol = protocol, "unsupported protocol, skipping");
             Err(ParseError::UnsupportedScheme {
@@ -984,6 +1081,45 @@ fn parse_hysteria2_config(value: &Value) -> Result<Hysteria2Config, ParseError> 
 
     if let Some(obfs_password) = obj.get("obfs_password").and_then(|v| v.as_str()) {
         config = config.set_obfs_password(obfs_password);
+    }
+
+    Ok(config)
+}
+
+#[cfg(feature = "trojan")]
+fn parse_trojan_config(value: &Value) -> Result<TrojanConfig, ParseError> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| ParseError::InvalidJsonStructure {
+            expected: "object".to_string(),
+            found: value_type_name(value),
+        })?;
+
+    let mut config = TrojanConfig::new();
+
+    if let Some(sni) = obj.get("sni").and_then(|v| v.as_str()) {
+        config = config.set_sni(sni);
+    }
+    if let Some(skip) = obj.get("skip_cert_verify").and_then(|v| v.as_bool()) {
+        config = config.set_skip_cert_verify(skip);
+    }
+    if let Some(alpn) = obj.get("alpn").and_then(|v| v.as_str()) {
+        config = config.set_alpn(alpn);
+    }
+    if let Some(enabled) = obj.get("ws_enabled").and_then(|v| v.as_bool()) {
+        config = config.set_ws_enabled(enabled);
+    }
+    if let Some(path) = obj.get("ws_path").and_then(|v| v.as_str()) {
+        config = config.set_ws_path(path);
+    }
+    if let Some(host) = obj.get("ws_host").and_then(|v| v.as_str()) {
+        config = config.set_ws_host(host);
+    }
+    if let Some(headers) = obj.get("ws_headers").and_then(|v| v.as_str()) {
+        config = config.set_ws_headers(headers);
+    }
+    if let Some(timeout) = obj.get("connection_timeout").and_then(|v| v.as_u64()) {
+        config = config.set_connection_timeout(Duration::from_secs(timeout));
     }
 
     Ok(config)

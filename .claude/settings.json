@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \":*)",
+      "Read(//c/Users/tea/.claude/projects/c--Users-tea-Downloads-roxie-development/memory/**)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\tea\\.claude\\projects\\c--Users-tea-Downloads-roxie-development\\memory"
+    ]
+  }
+}
